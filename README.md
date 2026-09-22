@@ -4,8 +4,29 @@ A production-tracking app for the **Winding → Final QA** capacitor batch card 
 
 This is a sibling app to CALGAS CAPACITORS' **Stock Management** app, not a replacement for the broader Manufacturing Tracker (order-to-dispatch) project — ELE Tracker's scope is specifically the physical Winding-to-FQA batch card.
 
-**Current version:** 1.2.0
+**Current version:** 1.2.1
 **Repo:** `calgas/Ele-Tracker` · **Hosted:** https://calgas.github.io/Ele-Tracker/
+
+---
+
+## What changed in 1.2.1
+
+### FG Code and Customer Name are proper dropdowns
+
+Both fields were `<input list>` with a `<datalist>`. On Android, Chrome doesn't show a datalist under the field — it puts the options in the keyboard's suggestion strip, as a sideways-scrolling row of chips above the keys.
+
+`enhanceDatalist_` now upgrades every `<input list>` into the same dropdown the app's selects already use. It removes the `list` attribute (which is what handed the options to the keyboard), and the input itself stays the real field. Two things therefore behave exactly as before:
+
+- **FG Code** still holds `"CODE — NAME"` and is still checked by `resolveFgCode()` at submit. In the dropdown the code and name show on two lines, so both stay readable on a narrow phone.
+- **Customer Name** still accepts free text, so a customer not yet in Dropdowns can be entered. Nothing is pre-highlighted, so pressing Enter keeps what was typed instead of swapping in the first suggestion.
+
+The datalist stays in the page as the data source and is read afresh each time the dropdown opens, since it's repopulated once the FG catalog and Dropdowns load.
+
+### Dropdowns no longer open behind the keyboard
+
+Every dropdown — selects included — used to open downward at a fixed 240px. Focusing a field raises the keyboard, which covers the lower part of the screen without changing the page layout; only the *visual* viewport shrinks. A field in the lower half of a form therefore opened its list straight behind the keyboard.
+
+Lists are now placed against the visual viewport: below the field if there's room, above it if there's more room there, never taller than the space actually visible, and never extending under the sticky top bar. They re-place as the keyboard slides in, since it arrives after the focus rather than with it.
 
 ---
 
@@ -176,7 +197,7 @@ sw.js          Service worker — app-shell caching; backend calls always networ
 
 ### Deploying a frontend update
 
-Bump the `app-version` meta tag in `index.html` and `CACHE_VERSION` in `sw.js` together, or installed clients keep serving the old shell. Currently `1.2.0` / `ele-tracker-shell-v4`.
+Bump the `app-version` meta tag in `index.html` and `CACHE_VERSION` in `sw.js` together, or installed clients keep serving the old shell. Currently `1.2.1` / `ele-tracker-shell-v5`.
 
 ---
 
