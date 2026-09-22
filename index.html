@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ELE Tracker</title>
 <meta name="theme-color" content="#f3f0ea" id="metaThemeColor">
-<meta name="app-version" content="1.2.0">
+<meta name="app-version" content="1.2.1">
 <link rel="manifest" href="./manifest.json">
 <link rel="icon" href="https://calgas.github.io/Stock-Management/logo/icon-192.png">
 <link rel="apple-touch-icon" href="https://calgas.github.io/Stock-Management/logo/icon-512.png">
@@ -223,6 +223,21 @@
   .combo-option.is-selected { font-weight: 700; }
   .combo-option.is-selected::after { content: ' ✓'; color: var(--copper); }
   .combo-empty { padding: 12px; font-size: 13px; color: var(--ink-faint); text-align: center; }
+  /* Opens upward when the space below the field is too short — usually
+     because the on-screen keyboard has taken the lower half of the screen.
+     max-height is set per-open from the space actually visible (see
+     placeComboList_), so this only has to flip the anchor. */
+  .combo-list.open-up { top: auto; bottom: calc(100% + 4px); }
+  /* Suggestion dropdowns (upgraded <input list> fields) carry free-form
+     labels such as "CODE — NAME"; those wrap rather than being cut off,
+     and a code/name pair is split onto two lines so both stay readable on
+     a narrow phone. */
+  .combo-suggest .combo-option { white-space: normal; overflow: visible; }
+  .combo-opt-sub { display: block; margin-top: 2px; font-size: 12px; font-weight: 500; color: var(--ink-faint); }
+  .combo-option.is-active .combo-opt-sub { color: inherit; opacity: 0.8; }
+  /* When a focused combobox is scrolled into view, keep it clear of the
+     sticky top bar instead of parking it underneath. */
+  .combo .combo-input { scroll-margin-top: 96px; scroll-margin-bottom: 12px; }
   /* Enhanced native selects — the real <select> stays in the DOM (so all
      existing .value reads and change listeners keep working) but is taken
      out of the visual and tab flow. */
@@ -1204,20 +1219,6 @@ function timeAgo(date) {
   return hrs + (hrs === 1 ? ' hr ago' : ' hrs ago');
 }
 /* =========================================================================
-   SEARCHABLE SELECTS — upgrades every native <select> in the app to the same
-   type-to-filter combobox used by the item form.
-
-   The native <select> is kept in the DOM as the source of truth and only
-   visually hidden. That way every existing `el.value` read, `el.value = x`
-   write, and 'change' listener keeps working untouched — the combobox is
-   purely a presentation layer over it. Two hooks keep the two in sync:
-     - a MutationObserver, because most of these are repopulated by
-       replacing innerHTML (populateCategoryFilters, populateLedgerFilters…)
-     - a per-element override of the `value` setter, because assigning
-       `select.value` programmatically (e.g. the dashboard drill-down reset)
-       fires no event that could be listened for.
-   ========================================================================= */
-/* =========================================================================
    CHANGE PASSWORD — routed through stockApi, not eleApi: accounts and
    sessions live in Stock Management's spreadsheet (this app shares them),
    so that's the backend that owns the password.
@@ -1253,6 +1254,74 @@ async function handleChangePassword(e) {
   } catch (err) {
     errEl.textContent = err.message;
   } finally { clearBtnLoading(btn, 'Update password'); }
+}
+
+/* =========================================================================
+   SEARCHABLE DROPDOWNS — one dropdown look for every picker in the app.
+
+   Native <select>s are upgraded by enhanceSelect_ into a type-to-filter
+   combobox. The <select> stays in the DOM as the source of truth and is
+   only visually hidden, so every existing `el.value` read, `el.value = x`
+   write and 'change' listener keeps working untouched. Two hooks keep the
+   two in sync:
+     - a MutationObserver, because most selects are repopulated by
+       replacing innerHTML
+     - a per-element override of the `value` setter, because assigning
+       `select.value` programmatically fires no event to listen for.
+
+   <input list="…"> fields are upgraded by enhanceDatalist_ into the same
+   look. The browser's own datalist UI can't be used: on Android, Chrome
+   shows a datalist in the keyboard's suggestion strip rather than under
+   the field. Here the input itself stays the real field, and free text is
+   still accepted, so a datalist's "suggest, don't restrict" behaviour
+   is unchanged.
+
+   Both place their list with placeComboList_, against the part of the
+   screen actually visible — see below.
+   ========================================================================= */
+
+// Focusing a text field on a phone raises the keyboard, which covers the
+// lower part of the screen. The layout doesn't change — only the visual
+// viewport shrinks — so a list that always opens downward at a fixed
+// height lands behind the keyboard. Placement is measured against the
+// visual viewport instead: below the field if there's room, above it if
+// there's more room there, and never taller than what can be seen. The
+// sticky top bar counts as not visible, so an upward list stops short of it.
+const COMBO_MIN_ROOM = 160;   // less than this below the field → prefer above
+const COMBO_MAX_HEIGHT = 280;
+const COMBO_MIN_HEIGHT = 96;
+let activeCombo_ = null;
+
+function placeComboList_(input, list) {
+  const vv = window.visualViewport;
+  let top = vv ? vv.offsetTop : 0;
+  const bottom = vv ? vv.offsetTop + vv.height : window.innerHeight;
+  const bar = document.querySelector('.topbar');
+  if (bar) top = Math.max(top, bar.getBoundingClientRect().bottom);
+
+  const r = input.getBoundingClientRect();
+  const below = bottom - r.bottom - 12;
+  const above = r.top - top - 12;
+  const up = below < COMBO_MIN_ROOM && above > below;
+  list.classList.toggle('open-up', up);
+  list.style.maxHeight = Math.max(COMBO_MIN_HEIGHT, Math.min(COMBO_MAX_HEIGHT, up ? above : below)) + 'px';
+}
+function showComboList_(input, list) {
+  activeCombo_ = { input: input, list: list };
+  placeComboList_(input, list);
+}
+function hideComboList_(list) {
+  if (activeCombo_ && activeCombo_.list === list) activeCombo_ = null;
+}
+// The keyboard slides up after focus, not with it, so the space available
+// changes while the list is already open. Re-place on every visual
+// viewport change until it closes.
+if (window.visualViewport) {
+  const replaceActiveCombo = function () {
+    if (activeCombo_ && !activeCombo_.list.classList.contains('hidden')) placeComboList_(activeCombo_.input, activeCombo_.list);
+  };
+  window.visualViewport.addEventListener('resize', replaceActiveCombo);
+  window.visualViewport.addEventListener('scroll', replaceActiveCombo);
 }
 
 function enhanceSelect_(select) {
@@ -1317,8 +1386,9 @@ function enhanceSelect_(select) {
         }).join('');
     list.classList.remove('hidden');
     input.setAttribute('aria-expanded', 'true');
+    showComboList_(input, list);
   }
-  function closeList() { list.classList.add('hidden'); input.setAttribute('aria-expanded', 'false'); }
+  function closeList() { list.classList.add('hidden'); input.setAttribute('aria-expanded', 'false'); hideComboList_(list); }
   function commit(value) {
     select.value = value;
     syncDisplay();
@@ -1381,6 +1451,115 @@ function enhanceSelect_(select) {
 // as a native picker.
 function enhanceAllSelects_() {
   document.querySelectorAll('select:not(.no-combo)').forEach(enhanceSelect_);
+}
+
+// Upgrades an <input list="…"> into the app's dropdown. The <datalist> is
+// kept as the data source and read afresh on every open, because the lists
+// are repopulated by innerHTML once the FG catalog and Dropdowns arrive.
+function enhanceDatalist_(input) {
+  if (input.dataset.comboReady) return;
+  const datalist = document.getElementById(input.getAttribute('list'));
+  if (!datalist) return;
+  input.dataset.comboReady = '1';
+
+  // The list attribute is what hands the options to the browser, and so to
+  // Android's keyboard strip. Without it, this component is the only
+  // dropdown the field has.
+  input.removeAttribute('list');
+  input.autocomplete = 'off';
+  input.classList.add('combo-input');
+  input.setAttribute('role', 'combobox');
+  input.setAttribute('aria-autocomplete', 'list');
+  input.setAttribute('aria-expanded', 'false');
+
+  const wrap = document.createElement('div');
+  wrap.className = 'combo combo-suggest';
+  input.parentNode.insertBefore(wrap, input);
+  wrap.appendChild(input);
+
+  const toggle = document.createElement('button');
+  toggle.type = 'button';
+  toggle.className = 'combo-toggle';
+  toggle.tabIndex = -1;
+  toggle.setAttribute('aria-label', 'Show options');
+  toggle.innerHTML = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M4 6.5L8 10.5L12 6.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  const list = document.createElement('div');
+  list.className = 'combo-list hidden';
+  list.setAttribute('role', 'listbox');
+  wrap.appendChild(toggle); wrap.appendChild(list);
+
+  function optionsOf() {
+    return Array.from(datalist.options).map(function (o) { return o.value; }).filter(Boolean);
+  }
+  // "CODE — NAME" shows as the code with the name on a second line.
+  function optionHtml(value) {
+    const i = value.indexOf(' — ');
+    if (i === -1) return escapeHtml(value);
+    return escapeHtml(value.slice(0, i)) + '<span class="combo-opt-sub">' + escapeHtml(value.slice(i + 3)) + '</span>';
+  }
+  function openList(filter) {
+    const q = String(filter || '').trim().toLowerCase();
+    const shown = optionsOf().filter(function (v) { return !q || v.toLowerCase().indexOf(q) > -1; });
+    // Nothing is pre-highlighted, unlike the select picker: here Enter must
+    // keep what was typed — a new customer, say — not swap in the first
+    // suggestion.
+    list.innerHTML = shown.length === 0
+      ? '<div class="combo-empty">' + (q ? 'No match — what you typed will be used' : 'No options yet') + '</div>'
+      : shown.map(function (v) {
+          return '<div class="combo-option' + (v === input.value ? ' is-selected' : '') + '" role="option" data-value="' + escapeHtml(v) + '">' + optionHtml(v) + '</div>';
+        }).join('');
+    list.classList.remove('hidden');
+    input.setAttribute('aria-expanded', 'true');
+    showComboList_(input, list);
+  }
+  function closeList() { list.classList.add('hidden'); input.setAttribute('aria-expanded', 'false'); hideComboList_(list); }
+
+  let committing = false;
+  function commit(value) {
+    input.value = value;
+    closeList();
+    // Fired so any listener on the field sees a picked value the same way
+    // as a typed one; the guard stops our own input handler reopening it.
+    committing = true;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    committing = false;
+  }
+
+  input.addEventListener('focus', function () { input.select(); openList(''); });
+  input.addEventListener('input', function () { if (!committing) openList(input.value); });
+  input.addEventListener('blur', function () { setTimeout(function () { if (!wrap.contains(document.activeElement)) closeList(); }, 0); });
+  toggle.addEventListener('mousedown', function (e) {
+    e.preventDefault();
+    if (list.classList.contains('hidden')) { input.focus(); openList(''); } else { closeList(); }
+  });
+  list.addEventListener('mousedown', function (e) {
+    const opt = e.target.closest('.combo-option');
+    if (!opt) return;
+    e.preventDefault(); // keep focus, so blur doesn't close the list mid-pick
+    commit(opt.dataset.value);
+  });
+  input.addEventListener('keydown', function (e) {
+    if (list.classList.contains('hidden') && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) { openList(input.value); return; }
+    const opts = Array.from(list.querySelectorAll('.combo-option'));
+    let idx = opts.findIndex(function (o) { return o.classList.contains('is-active'); });
+    if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && opts.length) {
+      e.preventDefault();
+      idx = e.key === 'ArrowDown' ? Math.min(idx + 1, opts.length - 1) : Math.max(idx - 1, 0);
+      opts.forEach(function (o) { o.classList.remove('is-active'); });
+      opts[idx].classList.add('is-active');
+      opts[idx].scrollIntoView({ block: 'nearest' });
+    } else if (e.key === 'Enter' && idx > -1 && !list.classList.contains('hidden')) {
+      e.preventDefault();
+      commit(opts[idx].dataset.value);
+    } else if (e.key === 'Escape') {
+      closeList();
+    }
+  });
+}
+
+function enhanceAllDatalists_() {
+  document.querySelectorAll('input[list]').forEach(enhanceDatalist_);
 }
 
 function fillSelect(id, options, placeholder) {
@@ -3135,10 +3314,11 @@ document.getElementById('exportFqBtn').addEventListener('click', function () {
   openExportPicker(state.finalQaResults, FQ_COLUMNS, 'ele-tracker-final-qa', 'Final QA');
 });
 
-// Last statement in the script: every change listener above is attached by
-// now, so the change events the enhancer dispatches on selection land where
-// they should.
+// Last statements in the script: every change listener above is attached
+// by now, so the change events the enhancers dispatch on selection land
+// where they should.
 enhanceAllSelects_();
+enhanceAllDatalists_();
 
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', function () {
