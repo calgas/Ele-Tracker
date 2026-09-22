@@ -23,7 +23,7 @@
 // of being stuck on an old cached one. Keep it in step with the
 // app-version meta tag in index.html.
 const CACHE_PREFIX = 'ele-tracker-shell-';
-const CACHE_VERSION = CACHE_PREFIX + 'v4';
+const CACHE_VERSION = CACHE_PREFIX + 'v5';
 const APP_SHELL = ['./index.html', './manifest.json'];
 
 self.addEventListener('install', (e) => {
