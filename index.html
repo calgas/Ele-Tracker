@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ELE Tracker</title>
 <meta name="theme-color" content="#f3f0ea" id="metaThemeColor">
-<meta name="app-version" content="1.2.1">
+<meta name="app-version" content="1.4.0">
 <link rel="manifest" href="./manifest.json">
 <link rel="icon" href="https://calgas.github.io/Stock-Management/logo/icon-192.png">
 <link rel="apple-touch-icon" href="https://calgas.github.io/Stock-Management/logo/icon-512.png">
@@ -1151,12 +1151,37 @@ function mayHaveCommitted(action) {
   return !(action === 'ping' || action === 'whoami' || action === 'login' || /^get[A-Z]/.test(action));
 }
 
-async function callApi(url, action, params) {
-  params = params || {};
-  const body = Object.assign({ action: action }, params);
-  if (state.session && action !== 'login') body.token = state.session.token;
-  setConnSyncing(true);
+// Waits before each retry when Google's reply isn't the app's own. Its
+// hiccups tend to pass within seconds, so a few spaced tries ride through
+// most of them. Only reads are retried: ELE's writes carry no duplicate
+// protection, so one that got an odd reply may already be saved.
+const ODD_REPLY_BACKOFF_MS = [1500, 3000, 6000];
 
+function isSessionRejection(message) {
+  return /invalid or expired session|invalid session|session expired|missing session|another device/i.test(message || '');
+}
+
+// When Google's reply isn't the app's JSON, what it actually was is kept —
+// the last ten — so the cause can be seen rather than guessed at:
+// copy(localStorage.ele_api_diag) in the browser console.
+function recordOddReply(action, res, text, kind) {
+  const entry = {
+    at: new Date().toISOString(), action: action, kind: kind,
+    status: res ? res.status : null, url: res ? res.url : null, redirected: res ? res.redirected : null,
+    type: res ? res.headers.get('content-type') : null,
+    body: String(text || '').replace(/\s+/g, ' ').slice(0, 300)
+  };
+  try {
+    const list = JSON.parse(localStorage.getItem('ele_api_diag') || '[]');
+    list.push(entry);
+    localStorage.setItem('ele_api_diag', JSON.stringify(list.slice(-10)));
+  } catch (e) {}
+  if (window.console && console.warn) console.warn('[CALGAS] Unexpected reply from Google', entry);
+}
+
+// One attempt. An odd reply comes back as { odd: true } for the caller to
+// decide about; everything else is the answer or a real refusal.
+async function callOnce(url, action, body) {
   const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
   const timer = controller ? setTimeout(function () { controller.abort(); }, REQUEST_TIMEOUT_MS) : null;
   try {
@@ -1166,16 +1191,31 @@ async function callApi(url, action, params) {
       body: JSON.stringify(body),
       signal: controller ? controller.signal : undefined
     });
-    // Apps Script answers some failures (quota, a broken deployment) with an
-    // HTML page instead of JSON. Without this, the operator would see a raw
-    // parser error like "Unexpected token <".
+    const text = await res.text();
     let json;
-    try { json = await res.json(); }
+    try { json = JSON.parse(text); }
     catch (parseErr) {
-      throw new Error('The server sent an unexpected response' + (res.status ? ' (HTTP ' + res.status + ')' : '') + '. Try again, and tell an admin if it keeps happening.');
+      recordOddReply(action, res, text, 'unreadable');
+      // Google's own sign-in page: the deployment isn't open to everyone.
+      // Retrying can't fix a setting, so it's said plainly instead.
+      if (/accounts\.google\.com|ServiceLogin/i.test((res.url || '') + ' ' + text.slice(0, 2000))) {
+        throw new Error('Google asked for a sign-in, which means the backend deployment\u2019s \u201cWho has access\u201d ' +
+                        'isn\u2019t set to Anyone. An Admin needs to change it under Deploy \u2192 Manage deployments.');
+      }
+      return { odd: true };
     }
-    if (!json.success) throw new Error(json.error || 'Request failed');
-    return json.data;
+    // doGet's reply: the POST reached Google as a GET, bounced through a
+    // redirect. It says nothing about whether the original POST ran.
+    if (!json.success && /POST requests only/i.test(json.error || '')) {
+      recordOddReply(action, res, text, 'bounced');
+      return { odd: true };
+    }
+    if (!json.success) {
+      const failed = new Error(json.error || 'Request failed');
+      failed.sessionRejected = isSessionRejection(json.error);
+      throw failed;
+    }
+    return { data: json.data };
   } catch (err) {
     if (err && err.name === 'AbortError') {
       throw new Error(mayHaveCommitted(action)
@@ -1185,19 +1225,90 @@ async function callApi(url, action, params) {
     throw err;
   } finally {
     if (timer) clearTimeout(timer);
+  }
+}
+
+async function callApi(url, action, params) {
+  params = params || {};
+  const body = Object.assign({ action: action }, params);
+  if (state.session && action !== 'login') body.token = state.session.token;
+  setConnSyncing(true);
+  try {
+    for (let attempt = 0; ; attempt++) {
+      const r = await callOnce(url, action, body);
+      if (!r.odd) return r.data;
+      if (mayHaveCommitted(action)) {
+        throw new Error('Google sent back an unexpected reply, so it isn\u2019t certain this was saved. ' +
+                        'Check the entries list before submitting it again.');
+      }
+      if (attempt >= ODD_REPLY_BACKOFF_MS.length) {
+        throw new Error('Google sent back an unexpected reply, even after a few tries. It usually clears within a minute \u2014 try again shortly.');
+      }
+      await new Promise(function (r2) { setTimeout(r2, ODD_REPLY_BACKOFF_MS[attempt]); });
+    }
+  } catch (err) {
+    // Refused mid-use — most often because the account signed in to ELE on
+    // another device. At startup, boot() deals with it instead.
+    if (err.sessionRejected && action !== 'login' && action !== 'logout' &&
+        !document.getElementById('appShell').classList.contains('hidden')) {
+      endSessionHere(err.message);
+    }
+    throw err;
+  } finally {
     setConnSyncing(false);
   }
 }
+
+// Rather than leaving every Save to fail, the page goes to sign-in and says
+// why.
+let sessionEnding = false;
+function endSessionHere(message) {
+  if (sessionEnding) return;
+  sessionEnding = true;
+  clearSession();
+  document.querySelectorAll('.modal-overlay').forEach(function (m) { m.classList.add('hidden'); });
+  show('loginScreen');
+  const errEl = document.getElementById('loginError');
+  if (errEl) {
+    errEl.textContent = /another device/i.test(message || '')
+      ? 'You were signed out here because this account signed in to ELE Tracker on another device.'
+      : 'Your session has ended \u2014 please sign in again.';
+  }
+  setTimeout(function () { sessionEnding = false; }, 1000);
+}
+
+
 function eleApi(action, params) { return callApi(ELE_API_URL, action, params); }
 function stockApi(action, params) { return callApi(STOCK_API_URL, action, params); }
 
-function saveSession(session) { state.session = session; localStorage.setItem('stock_session', JSON.stringify(session)); }
+// Counts are never negative. The minus key is ignored, a pasted "-12"
+// becomes 12, and the e/E/+ of scientific notation are never counts. Only
+// number boxes — every one in ELE is a count — so test readings, typed in
+// the grids' text boxes, can still be negative.
+document.addEventListener('keydown', function (e) {
+  const el = e.target;
+  if (!el || el.tagName !== 'INPUT' || el.type !== 'number') return;
+  if (e.key === '-' || e.key === 'e' || e.key === 'E' || e.key === '+') e.preventDefault();
+}, true);
+document.addEventListener('input', function (e) {
+  const el = e.target;
+  if (!el || el.tagName !== 'INPUT' || el.type !== 'number' || el.value === '') return;
+  const n = Number(el.value);
+  if (!isNaN(n) && n < 0) el.value = String(Math.abs(n));
+}, true);
+
+// ELE Tracker's own sign-in, kept apart from Stock Management's and
+// Production Tracker's. All three apps live on calgas.github.io and so share
+// one browser storage; sharing one key meant signing in or out of any of
+// them did it to all of them. The backend keeps a session per app too.
+const SESSION_KEY = 'ele_session';
+function saveSession(session) { state.session = session; localStorage.setItem(SESSION_KEY, JSON.stringify(session)); }
 function loadSession() {
-  const raw = localStorage.getItem('stock_session');
+  const raw = localStorage.getItem(SESSION_KEY);
   if (!raw) return null;
   try { return JSON.parse(raw); } catch (e) { return null; }
 }
-function clearSession() { state.session = null; localStorage.removeItem('stock_session'); }
+function clearSession() { state.session = null; localStorage.removeItem(SESSION_KEY); }
 
 function show(id) {
   ['loginScreen', 'appShell'].forEach(function (s) { document.getElementById(s).classList.toggle('hidden', s !== id); });
@@ -2051,14 +2162,25 @@ function clearBtnLoading(btn, finalText) {
 async function boot() {
   initTheme();
   setLoaderProgress(15, 'Initializing…');
+  let startupNote = '';
   const saved = loadSession();
   if (saved && saved.token) {
     state.session = saved;
     setLoaderProgress(35, 'Restoring session…');
-    try { await enterApp(); return; } catch (err) { clearSession(); }
+    try { await enterApp(); return; } catch (err) {
+      // Only a session the backend refused is thrown away. A reply that
+      // didn't come back says nothing about the session, and signing people
+      // out over Google's hiccups made reloading feel like a fix.
+      if (/session|log in again|another device/i.test(err.message || '')) {
+        clearSession();
+      } else {
+        startupNote = 'Couldn\u2019t reach the server just now, so the app didn\u2019t open. You\u2019re still signed in \u2014 reload to try again.';
+      }
+    }
   }
   setLoaderProgress(100, 'Ready');
   show('loginScreen');
+  if (startupNote) { const el = document.getElementById('loginError'); if (el) el.textContent = startupNote; }
   await hideInitialLoader();
 }
 
@@ -2776,7 +2898,7 @@ document.getElementById('loginForm').addEventListener('submit', async function (
   errEl.textContent = '';
   setBtnLoading(btn, 'Signing in…');
   try {
-    const session = await stockApi('login', { username: document.getElementById('loginUsername').value.trim(), password: document.getElementById('loginPassword').value });
+    const session = await stockApi('login', { app: 'ele', username: document.getElementById('loginUsername').value.trim(), password: document.getElementById('loginPassword').value });
     saveSession(session);
     const loader = document.getElementById('initialLoader');
     if (loader) { loader.classList.remove('hidden', 'loader-exit'); loader.setAttribute('aria-busy', 'true'); }
@@ -2785,7 +2907,13 @@ document.getElementById('loginForm').addEventListener('submit', async function (
   } catch (err) { errEl.textContent = err.message; }
   finally { clearBtnLoading(btn, 'Sign in'); }
 });
-document.getElementById('logoutBtn').addEventListener('click', function () { clearSession(); location.reload(); });
+// Tells the backend, so the session row goes now rather than lingering in
+// the Sessions tab until it expires. Signing out never waits on that.
+document.getElementById('logoutBtn').addEventListener('click', function () {
+  const done = function () { clearSession(); location.reload(); };
+  const pending = state.session ? stockApi('logout', {}).catch(function () {}) : Promise.resolve();
+  Promise.race([pending, new Promise(function (r) { setTimeout(r, 2500); })]).then(done, done);
+});
 document.getElementById('themeToggleBtn').addEventListener('click', toggleTheme);
 document.getElementById('profileBtn').addEventListener('click', openPasswordModal);
 document.getElementById('pwdCloseBtn').addEventListener('click', closePasswordModal);
