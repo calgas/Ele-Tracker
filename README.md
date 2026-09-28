@@ -4,8 +4,51 @@ A production-tracking app for the **Winding → Final QA** capacitor batch card 
 
 This is a sibling app to CALGAS CAPACITORS' **Stock Management** app, not a replacement for the broader Manufacturing Tracker (order-to-dispatch) project — ELE Tracker's scope is specifically the physical Winding-to-FQA batch card.
 
-**Current version:** 1.2.1
+**Current version:** 1.3.0
 **Repo:** `calgas/Ele-Tracker` · **Hosted:** https://calgas.github.io/Ele-Tracker/
+
+---
+
+## What changed in 1.4.0
+
+**Every department can record its own stages.** Before, ELE treated each stage name as a department name. Only Winding matched a real department, so Spray, Short Clearance, Assembly and QA couldn't record their stages at all. Now access comes from Stock Management's Team & Access, and the new **Stage_Access** tab links each stage to the departments that record it. See **Permissions** below. A refusal says which departments record that stage.
+
+**Negative readings stay numbers.** Text that Sheets would read as a formula — a remark starting with `=` — is now stored as text, so it can't turn into #ERROR!. A reading that is simply a number, like `-2.5` from a test grid, is left alone, so Sheets still stores it as a number that sums and charts can use.
+
+**Dates are the day chosen.** A date from a form was stored as 05:30 that day, midnight UTC shown in India time. It is now midnight local time, on all eight stages.
+
+**Every entry is in an audit log.** The new **AuditLog** tab records who entered what, on which batch, and when. The session token is never written there.
+
+**Google's odd replies.** A read that gets an unexpected reply from Google now retries, after 1.5, 3 and 6 seconds, before giving up. A save never re-sends by itself: ELE's saves have no duplicate protection, so after an odd reply you're told to check the entries list before entering it again. What came back is kept for diagnosis: `copy(localStorage.ele_api_diag)` in the browser console. If Google answers with its own sign-in page, the message names the deployment setting to fix.
+
+**Signed in elsewhere.** If this account signs in to ELE on another device, this page goes to sign-in and says why. Before, every save just failed.
+
+**Counts can't go negative.** The minus key does nothing in count boxes, and a pasted `-12` becomes 12. Test readings are typed in text boxes, so they can still be negative.
+
+**Deploying:**
+
+1. Deploy Stock Management 3.12.0 first, then run `ADMIN_migrateAccess()` there once.
+2. Deploy this Code.gs as a new version, then run `ADMIN_setupSheet()` to create Stage_Access and AuditLog.
+3. Push index.html and sw.js.
+4. Everyone signs in to ELE again, so their session carries the new grants.
+
+## What changed in 1.3.0
+
+### Its own sign-in
+
+ELE Tracker used to keep its session under Stock Management's key, `stock_session` — both apps are on calgas.github.io and share one browser storage — so signing in or out of either did it to both. It now signs in as its own app and keeps its session under `ele_session`. Stock Management records the app on each session and keeps one sign-in per account *per app*, so ELE Tracker and Stock Management can be open together, on one device or several, without closing each other. Everyone signs in to ELE Tracker once after updating.
+
+### Signing out ends the session on the server
+
+Sign out used to clear the browser only, leaving the session row in the Sessions tab until it expired. It now ends the session on the server too, without waiting on it.
+
+### A hiccup while opening no longer signs you out
+
+Any failure while restoring the session used to throw the session away. Now only a session the backend refuses is ended; otherwise the sign-in screen says you're still signed in and to reload.
+
+### The service worker is out of the API path
+
+It re-sent every API request itself while caching none of them. API calls now go straight from the browser.
 
 ---
 
@@ -114,9 +157,30 @@ Every stage after Winding requires the batch to currently be sitting at the stag
 
 ### Permissions
 
-Admins can log every stage. Everyone else can log only the stage matching their **Department** in Stock Management's `Users` sheet. These nine names must exist in Stock Management's `Departments` tab **exactly as written** — a missing or differently-spelled one leaves that department's staff unable to log anything:
+Who may record which stage is decided in two places.
 
-`Winding` · `Spray & Core Cleaning` · `Heat Stabilization` · `Short Clearing` · `Welding & Soldering` · `Pouring & Curing` · `Electrical Testing & Packing` · `BDV & Final Testing` · `Final QA`
+**Stock Management's Team & Access**, on its ELE Tracker switch, has two features:
+
+- **Record your department's stages** — every tier except Management, by default
+- **Record any stage** — Managers, by default
+
+Admins record everything.
+
+**The Stage_Access tab** here says which departments each stage belongs to. Setup fills it once with the standard links; after that it is yours to edit, and setup never overwrites it.
+
+| Stage | Recorded by |
+|---|---|
+| Winding | Winding |
+| Spray & Core Cleaning | Spray |
+| Heat Stabilization | Spray |
+| Short Clearing | Short Clearance |
+| Welding & Soldering | Assembly-MFD, Assembly-kVAr |
+| Pouring & Curing | Assembly-MFD, Assembly-kVAr |
+| Electrical Testing & Packing | Assembly-MFD, Assembly-kVAr |
+| BDV & Final Testing | QA |
+| Final QA | QA |
+
+Several departments are separated by commas. Names must match Stock Management's **Departments** tab, though case and spacing don't matter. A stage left with no department can only be recorded by a Manager or an Admin. Viewing entries needs no permission.
 
 ---
 
@@ -132,7 +196,7 @@ Then, either way:
 
 1. In `Code.gs`, confirm `STOCK_SHEET_ID` is Stock Management's spreadsheet ID.
 2. **Deploy → New deployment → Web app.** Execute as *Me*, access *Anyone* (the app handles its own auth on top of this). Copy the `/exec` URL.
-3. Check Stock Management's `Departments` tab has all nine stage names above.
+3. Check the **Stage_Access** tab: its department names must match Stock Management's `Departments` tab.
 4. Fill in the **Dropdowns** tab (see below).
 
 **Updating the backend later:** use *Deploy → Manage deployments → Edit (pencil) → Version: New version*. That keeps the same `/exec` URL. Creating a *new* deployment instead issues a new URL, which `index.html` would then need.
