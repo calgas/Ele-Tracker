@@ -4,10 +4,30 @@ A production-tracking app for the **Winding → Final QA** capacitor batch card 
 
 This is a sibling app to CALGAS CAPACITORS' **Stock Management** app, not a replacement for the broader Manufacturing Tracker (order-to-dispatch) project — ELE Tracker's scope is specifically the physical Winding-to-FQA batch card.
 
-**Current version:** 1.3.0
+**Current version:** 1.5.0
 **Repo:** `calgas/Ele-Tracker` · **Hosted:** https://calgas.github.io/Ele-Tracker/
 
 ---
+
+## What changed in 1.5.0
+
+**A save can't be recorded twice.** Every save now carries an ID. If the reply is lost, the app sends it again by itself with the same ID, and the backend answers with what it already saved instead of saving it again. Pressing Save again after a "may have been saved" message is safe for the same reason. Before, a lost reply to Create batch made a second batch with a new serial number. IDs are kept in the new **Idempotency** tab.
+
+**Pouring & Curing can be marked Not applicable.** A batch that isn't poured is picked on the Pouring & Curing form and marked **Not applicable for this batch**. It moves on to Electrical Testing & Packing with no pouring entry, and the new **Stage_Skips** tab records who marked it and why (from Remarks). The stage order is unchanged: a poured batch is entered exactly as before.
+
+**Counts are checked.** A stage entry where Good + Reject comes to more than Total is refused. When Total is more than the previous stage passed as good, it is saved and the person is told to check it, since rework can add pieces.
+
+**Mistakes can be corrected, and Final QA records a verdict.** An Admin can void a batch's latest stage entry from its report. The entry stays in its tab, marked Voided with who, when and why, and the batch steps back so the stage can be entered again. Final QA now asks for a verdict: **Pass** marks the batch Complete, **Reject** marks it Rejected, and **Hold** keeps it at Final QA to be tested again. The verdict and date are on BatchMaster (`QAVerdict`, `CompletedDate`) and on each reading.
+
+**Faster saves, lighter lists.** The backend reads each tab's headers once per save, and grid rows (Final QA readings, test rounds, film load readings) go in with one write. The entry lists load the newest 2,000 rows of each tab; a batch's report fetches all of its own rows, however old.
+
+**Also:** a missing Stage_Access tab falls back to the standard stage access instead of breaking sign-in; a session with a blank expiry counts as expired; Short Clearing test-round dates are stored at midnight like every other date. `ADMIN_setupSheet()` now says if the script's time zone isn't Asia/Kolkata, which the financial-year serial depends on.
+
+**Deploying:**
+
+1. Deploy this Code.gs as a new version, then run `ADMIN_setupSheet()` once. It creates Stage_Skips and Idempotency, adds the new columns to existing tabs, and logs a time-zone warning if there is one.
+2. Push index.html and sw.js.
+3. If Production Tracker should trace ELE batches, put this spreadsheet's ID in its `ELE_SHEET_ID`.
 
 ## What changed in 1.4.0
 
@@ -153,7 +173,7 @@ On the server, every ELE request is checked directly against Stock Management's 
 
 Supporting tabs: `BatchMaster` (one row per batch, holds `CurrentStage` and `Status`), `FilmLoadReadings`, `Dropdowns`, and `Code_Sequences` (the FY serial counters).
 
-Every stage after Winding requires the batch to currently be sitting at the stage immediately before it — the app enforces the card's fixed order. Final QA submission also flips the batch's `Status` to `Complete`.
+Every stage after Winding requires the batch to currently be sitting at the stage immediately before it — the app enforces the card's fixed order. Pouring & Curing can instead be marked Not applicable (logged in `Stage_Skips`). Final QA's verdict sets the batch's `Status`: Pass → `Complete`, Reject → `Rejected`, Hold → `On Hold`, still at Final QA for a retest. An Admin can void a batch's latest stage entry from its report, which steps it back a stage.
 
 ### Permissions
 
@@ -261,7 +281,7 @@ sw.js          Service worker — app-shell caching; backend calls always networ
 
 ### Deploying a frontend update
 
-Bump the `app-version` meta tag in `index.html` and `CACHE_VERSION` in `sw.js` together, or installed clients keep serving the old shell. Currently `1.2.1` / `ele-tracker-shell-v5`.
+Bump the `app-version` meta tag in `index.html` and `CACHE_VERSION` in `sw.js` together, or installed clients keep serving the old shell. Currently `1.5.0` / `ele-tracker-shell-v8`.
 
 ---
 
@@ -271,5 +291,5 @@ Bump the `app-version` meta tag in `index.html` and `CACHE_VERSION` in `sw.js` t
 - **QR/barcode batch scanning** — considered and explicitly descoped, not planned.
 - **Same icon as Stock Management.** With both apps installed on one phone, the home-screen icons are identical and only the label (`StockApp` / `ELETracker`) tells them apart.
 - **Export styling needs `xlsx-js-style` from jsDelivr** (pinned at 1.2.0). If it can't be reached, exports fall back to unstyled CSV rather than failing. ELE only ever writes workbooks and never parses uploaded files, so the SheetJS file-reading vulnerability (CVE-2023-30533) that affected Stock Management's bulk import does not apply here.
-- **Pouring & Curing is required before Electrical Testing & Packing** in the stage order as coded, even though Pouring & Curing applies to Kvar/Aircon/Oil capacitors specifically. Worth confirming against the card for other product types.
+- **Pouring & Curing stays in the stage order.** A batch that isn't poured is marked Not applicable rather than skipped automatically by product type. If MFD batches never go through pouring, a per-FG rule could do this on its own; worth confirming against the card.
 - **No automated tests in the repo.** Changes are verified by syntax checks and by logic tests run against mocked Apps Script and browser APIs during development.

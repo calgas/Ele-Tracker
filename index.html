@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ELE Tracker</title>
 <meta name="theme-color" content="#f3f0ea" id="metaThemeColor">
-<meta name="app-version" content="1.4.0">
+<meta name="app-version" content="1.5.0">
 <link rel="manifest" href="./manifest.json">
 <link rel="icon" href="https://calgas.github.io/Stock-Management/logo/icon-192.png">
 <link rel="apple-touch-icon" href="https://calgas.github.io/Stock-Management/logo/icon-512.png">
@@ -198,6 +198,9 @@
   td.empty { text-align: center; padding: 32px; color: var(--ink-faint); background: transparent !important; box-shadow: none !important; }
   .status-pill { display: inline-flex; padding: 4px 12px; border-radius: 20px; font-size: 11.5px; font-weight: 700; background: var(--copper-soft); color: var(--copper-deep); border: 1px solid transparent; }
   .status-pill.ok { background: var(--ok-soft); color: var(--ok); }
+  .status-pill.bad { background: var(--critical-soft); color: var(--critical); }
+  .status-pill.hold { background: transparent; border-color: var(--copper); }
+  .btn-ghost.full { width: 100%; margin-top: 10px; }
   .skeleton-bar { height: 14px; border-radius: 6px; width: 100%; background: linear-gradient(90deg, var(--line-soft) 25%, var(--line) 37%, var(--line-soft) 63%); background-size: 400% 100%; animation: shimmer 1.5s ease infinite; }
 
   /* Pagination — mirrors Stock Manager's, brought over here since these
@@ -839,6 +842,7 @@
       <h2 class="stage-heading">Pouring &amp; Curing</h2>
     <div class="section card hidden" id="pouringCuringCard">
       <h2>Pouring &amp; Soaking/Curing <span class="hint">(Kvar, Aircon &amp; Oil capacitors)</span></h2>
+      <p class="lede" style="margin-bottom:14px">A batch that isn’t poured: pick it and press <b>Not applicable</b>. It moves on to Electrical Testing &amp; Packing, and anything in Remarks is kept as the reason.</p>
       <form id="pouringCuringForm">
         <div class="field"><label for="pcMasterBatchNo">Master batch no</label><select id="pcMasterBatchNo" required></select></div>
         <div class="field-row">
@@ -865,6 +869,7 @@
         <div class="field"><label for="pcRemarks">Remarks</label><input type="text" id="pcRemarks"></div>
         <div class="form-error" id="pouringCuringError"></div>
         <button type="submit" class="btn-primary full" id="pouringCuringSubmit">Log Pouring &amp; Curing</button>
+        <button type="button" class="btn-ghost full" id="pouringCuringSkip">Not applicable for this batch</button>
       </form>
     </div>
 
@@ -1004,7 +1009,7 @@
       <h2 class="stage-heading">Final QA</h2>
     <div class="section card hidden" id="finalQaCard">
       <h2>Final QA Inspection</h2>
-      <p class="lede" style="margin-bottom:14px">Last stage on the card — submitting here marks the batch Complete. Fill in whichever readings were tested for each sample.</p>
+      <p class="lede" style="margin-bottom:14px">Last stage on the card. Fill in whichever readings were tested for each sample, then the verdict: Pass marks the batch Complete, Reject marks it Rejected, and Hold keeps it here to be tested again.</p>
       <form id="finalQaForm">
         <div class="field"><label for="fqMasterBatchNo">Master batch no</label><select id="fqMasterBatchNo" required></select></div>
 
@@ -1018,6 +1023,12 @@
 
         <div class="field"><label for="fqFoaInspectorName">FOA inspector name</label><select id="fqFoaInspectorName"></select></div>
         <div class="field"><label for="fqNotes">Notes</label><input type="text" id="fqNotes"></div>
+        <div class="field"><label for="fqVerdict">Verdict</label><select id="fqVerdict" required>
+          <option value="">Select…</option>
+          <option value="Pass">Pass — batch Complete</option>
+          <option value="Hold">Hold — test again later</option>
+          <option value="Reject">Reject — batch Rejected</option>
+        </select></div>
 
         <div class="form-error" id="finalQaError"></div>
         <button type="submit" class="btn-primary full" id="finalQaSubmit">Submit Final QA</button>
@@ -1134,7 +1145,8 @@ const state = {
   pcEntries: [], pcLastUpdated: null,
   epEntries: [], epLastUpdated: null,
   bdEntries: [], bdLastUpdated: null,
-  finalQaResults: [], finalQaLastUpdated: null
+  finalQaResults: [], finalQaLastUpdated: null,
+  stageSkips: [], batchRecord: null
 };
 
 // A fetch has no timeout of its own, so on a weak shop-floor connection a
@@ -1145,17 +1157,56 @@ const REQUEST_TIMEOUT_MS = 30000;
 
 // Mirrors the backend's own rule for what counts as a read. A write that
 // times out may still have been saved — the answer was lost, not
-// necessarily the work — so its message must not invite a blind resubmit.
-// Login is safe to repeat and is treated like a read.
+// necessarily the work. Login is safe to repeat and is treated like a read.
 function mayHaveCommitted(action) {
   return !(action === 'ping' || action === 'whoami' || action === 'login' || /^get[A-Z]/.test(action));
 }
 
 // Waits before each retry when Google's reply isn't the app's own. Its
 // hiccups tend to pass within seconds, so a few spaced tries ride through
-// most of them. Only reads are retried: ELE's writes carry no duplicate
-// protection, so one that got an odd reply may already be saved.
+// most of them.
 const ODD_REPLY_BACKOFF_MS = [1500, 3000, 6000];
+
+const SAVE_UNCERTAIN = 'It may have been saved: press Save again, and if it was, it won\u2019t be saved twice.';
+
+// Every ELE save carries a clientTxnId. The backend records it with the
+// result, so the same save sent again — by the retries below, or by a
+// second press of Save after a lost reply — gets the first answer back
+// instead of being saved twice. A save keeps its ID until the backend has
+// answered it, across a reload too, so pressing Save again reuses it.
+// What counts as "the same save" is the action, the batch and the few
+// fields that tell one entry from the next.
+const PENDING_SAVES_KEY = 'ele_pending_saves';
+const PENDING_SAVE_TTL_MS = 6 * 60 * 60 * 1000;
+
+function pendingSaveKey(action, params) {
+  return [action, params.masterBatchNo || '', params.stage || '', params.fgCode || '', params.mcNo || '',
+          params.date || '', params.shift || ''].join('|');
+}
+function readPendingSaves() {
+  try { return JSON.parse(localStorage.getItem(PENDING_SAVES_KEY) || '{}') || {}; } catch (e) { return {}; }
+}
+function writePendingSaves(map) {
+  try { localStorage.setItem(PENDING_SAVES_KEY, JSON.stringify(map)); } catch (e) {}
+}
+function newClientTxnId() {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12) + Math.random().toString(36).slice(2, 12);
+}
+function clientTxnIdFor(key) {
+  const map = readPendingSaves();
+  const now = Date.now();
+  Object.keys(map).forEach(function (k) { if (!map[k] || now - map[k].at > PENDING_SAVE_TTL_MS) delete map[k]; });
+  if (!map[key]) map[key] = { id: newClientTxnId(), at: now };
+  writePendingSaves(map);
+  return map[key].id;
+}
+function settlePendingSave(key) {
+  const map = readPendingSaves();
+  delete map[key];
+  writePendingSaves(map);
+}
+function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
 function isSessionRejection(message) {
   return /invalid or expired session|invalid session|session expired|missing session|another device/i.test(message || '');
@@ -1217,10 +1268,22 @@ async function callOnce(url, action, body) {
     }
     return { data: json.data };
   } catch (err) {
+    // No answer at all, as against an answer that said no: the request may
+    // or may not have reached the backend.
     if (err && err.name === 'AbortError') {
-      throw new Error(mayHaveCommitted(action)
-        ? 'No response after 30 seconds. This may already be saved — check the entries list before submitting it again.'
+      const timedOut = new Error(mayHaveCommitted(action)
+        ? 'No response after 30 seconds, even after trying again. ' + SAVE_UNCERTAIN
         : 'No response after 30 seconds. Check your connection and try again.');
+      timedOut.indeterminate = true;
+      throw timedOut;
+    }
+    if (err instanceof TypeError) {
+      // fetch's own failure: the connection dropped.
+      const lost = new Error(mayHaveCommitted(action)
+        ? 'The connection dropped, even after trying again. ' + SAVE_UNCERTAIN
+        : 'Couldn\u2019t reach the server. Check your connection and try again.');
+      lost.indeterminate = true;
+      throw lost;
     }
     throw err;
   } finally {
@@ -1232,19 +1295,40 @@ async function callApi(url, action, params) {
   params = params || {};
   const body = Object.assign({ action: action }, params);
   if (state.session && action !== 'login') body.token = state.session.token;
+  // ELE's own saves carry an ID, so they are as safe to resend as a read.
+  // Stock Management calls made from here (sign-in, password) don't.
+  const saveKey = url === ELE_API_URL && mayHaveCommitted(action) ? pendingSaveKey(action, params) : null;
+  if (saveKey) body.clientTxnId = clientTxnIdFor(saveKey);
+  const resendable = !mayHaveCommitted(action) || !!saveKey;
   setConnSyncing(true);
   try {
-    for (let attempt = 0; ; attempt++) {
-      const r = await callOnce(url, action, body);
-      if (!r.odd) return r.data;
-      if (mayHaveCommitted(action)) {
+    let oddTries = 0, lostTries = 0;
+    for (;;) {
+      let r;
+      try {
+        r = await callOnce(url, action, body);
+      } catch (err) {
+        // No answer: a save is sent once more with the same ID. If the
+        // first got through, the backend answers with what it saved.
+        if (err.indeterminate && saveKey && lostTries < 1) { lostTries++; await wait(2000); continue; }
+        // The backend answered no: nothing was saved, so the next try is a
+        // new entry with a new ID.
+        if (!err.indeterminate && saveKey) settlePendingSave(saveKey);
+        throw err;
+      }
+      if (!r.odd) {
+        if (saveKey) settlePendingSave(saveKey);
+        return r.data;
+      }
+      if (!resendable) {
         throw new Error('Google sent back an unexpected reply, so it isn\u2019t certain this was saved. ' +
-                        'Check the entries list before submitting it again.');
+                        'Check before doing it again.');
       }
-      if (attempt >= ODD_REPLY_BACKOFF_MS.length) {
-        throw new Error('Google sent back an unexpected reply, even after a few tries. It usually clears within a minute \u2014 try again shortly.');
+      if (oddTries >= ODD_REPLY_BACKOFF_MS.length) {
+        throw new Error('Google sent back an unexpected reply, even after a few tries. ' +
+                        (saveKey ? SAVE_UNCERTAIN : 'It usually clears within a minute \u2014 try again shortly.'));
       }
-      await new Promise(function (r2) { setTimeout(r2, ODD_REPLY_BACKOFF_MS[attempt]); });
+      await wait(ODD_REPLY_BACKOFF_MS[oddTries++]);
     }
   } catch (err) {
     // Refused mid-use — most often because the account signed in to ELE on
@@ -1314,10 +1398,19 @@ function show(id) {
   ['loginScreen', 'appShell'].forEach(function (s) { document.getElementById(s).classList.toggle('hidden', s !== id); });
 }
 function escapeHtml(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
-function toast(msg, isError) {
+function toast(msg, isError, ms) {
   const el = document.getElementById('toast');
   el.textContent = msg; el.className = 'toast show' + (isError ? ' error' : '');
-  clearTimeout(toast._t); toast._t = setTimeout(function () { el.classList.remove('show'); }, 3500);
+  clearTimeout(toast._t); toast._t = setTimeout(function () { el.classList.remove('show'); }, ms || 3500);
+}
+// What a save says when it's done. A save that had already gone through
+// (sent again after a lost reply) and a count the backend thought odd each
+// add a line, and stay up long enough to read.
+function savedToast(result, message) {
+  const extra = [];
+  if (result && result.duplicate) extra.push('It had already gone through, so nothing was saved twice.');
+  if (result && result.warning) extra.push(result.warning);
+  toast(message + (extra.length ? '. ' + extra.join(' ') : ''), false, extra.length ? 9000 : undefined);
 }
 function timeAgo(date) {
   if (!date) return 'never';
@@ -1912,6 +2005,7 @@ const BATCH_COLUMNS = [
   { key: 'CanSize', label: 'Can Size' }, { key: 'BarrierHeightTurns', label: 'Barrier Height & Turns' },
   { key: 'CoreLength', label: 'Core Length' }, { key: 'CoreOD', label: 'Core OD' },
   { key: 'CurrentStage', label: 'Stage' }, { key: 'Status', label: 'Status' },
+  { key: 'QAVerdict', label: 'QA Verdict' }, { key: 'CompletedDate', label: 'Completed', fmt: fmtDateCol },
   { key: 'CreatedDate', label: 'Created', fmt: fmtDateCol }, { key: 'CreatedBy', label: 'Created By' }
 ];
 const WINDING_COLUMNS = [
@@ -1989,7 +2083,12 @@ const BD_COLUMNS = [
 ];
 const FQ_COLUMNS = [
   { key: 'MasterBatchNo', label: 'Master Batch No' }, { key: 'TestType', label: 'Test Type' }, { key: 'SampleID', label: 'Sample' },
-  { key: 'Reading', label: 'Reading' }, { key: 'FOAInspectorName', label: 'FOA Inspector' }, { key: 'Notes', label: 'Notes' }
+  { key: 'Reading', label: 'Reading' }, { key: 'FOAInspectorName', label: 'FOA Inspector' }, { key: 'Notes', label: 'Notes' },
+  { key: 'Date', label: 'Date', fmt: fmtDateCol }, { key: 'Verdict', label: 'Verdict' }
+];
+const SKIP_COLUMNS = [
+  { key: 'MasterBatchNo', label: 'Master Batch No' }, { key: 'Stage', label: 'Stage' }, { key: 'Date', label: 'Date', fmt: fmtDateCol },
+  { key: 'By', label: 'Marked By' }, { key: 'Reason', label: 'Reason' }
 ];
 
 // Theme — persisted in localStorage, falls back to system preference.
@@ -2278,7 +2377,7 @@ async function enterApp() {
   renderTableSkeleton('epTableBody', 7, 4);
   renderTableSkeleton('bdTableBody', 7, 4);
   renderTableSkeleton('fqTableBody', 5, 4);
-  await Promise.all([loadBatches(), loadWindingEntries(), loadSprayEntries(), loadHeatStabEntries(), loadScEntries(), loadScTestResults(), loadWdEntries(), loadPcEntries(), loadEpEntries(), loadBdEntries(), loadFinalQaResults()]);
+  await loadEverything();
   setLoaderProgress(100, 'Ready');
   await hideInitialLoader();
   setInterval(function () {
@@ -2294,6 +2393,7 @@ async function enterApp() {
     loadEpEntries().catch(function (err) { console.error(err); });
     loadBdEntries().catch(function (err) { console.error(err); });
     loadFinalQaResults().catch(function (err) { console.error(err); });
+    loadStageSkips();
   }, 45000);
   setInterval(updateFreshnessLabels, 20000);
 }
@@ -2436,6 +2536,16 @@ function updateFreshnessLabels() {
   });
 }
 
+function loadEverything() {
+  return Promise.all([loadBatches(), loadWindingEntries(), loadSprayEntries(), loadHeatStabEntries(), loadScEntries(), loadScTestResults(), loadWdEntries(), loadPcEntries(), loadEpEntries(), loadBdEntries(), loadFinalQaResults(), loadStageSkips()]);
+}
+
+// Stages marked not applicable, for the batch report. Never stops the app
+// opening: a backend from before 1.5 doesn't know the action.
+async function loadStageSkips() {
+  try { state.stageSkips = await eleApi('getStageSkips'); } catch (err) { state.stageSkips = []; }
+}
+
 async function loadBatches() {
   state.batches = await eleApi('getBatchMasterList');
   state.batchesLastUpdated = new Date();
@@ -2459,6 +2569,8 @@ function getFilteredBatches() {
 function renderBatches() {
   const inProcess = state.batches.filter(function (b) { return b.Status === 'In Process'; });
   const complete = state.batches.filter(function (b) { return b.Status === 'Complete'; });
+  const onHold = state.batches.filter(function (b) { return b.Status === 'On Hold'; });
+  const rejected = state.batches.filter(function (b) { return b.Status === 'Rejected'; });
   document.getElementById('statTotalBatches').textContent = state.batches.length;
   document.getElementById('statInProcess').textContent = inProcess.length;
 
@@ -2467,7 +2579,9 @@ function renderBatches() {
   // in-process batches are sitting at, busiest first.
   document.getElementById('statTotalSub').innerHTML = state.batches.length === 0 ? '' :
     '<span class="sub-ok">' + complete.length + ' complete</span><span class="sub-sep">·</span>' +
-    '<span class="sub-low">' + inProcess.length + ' in process</span>';
+    '<span class="sub-low">' + inProcess.length + ' in process</span>' +
+    (onHold.length ? '<span class="sub-sep">·</span><span class="sub-muted">' + onHold.length + ' on hold</span>' : '') +
+    (rejected.length ? '<span class="sub-sep">·</span><span class="sub-muted">' + rejected.length + ' rejected</span>' : '');
 
   const byStage = {};
   inProcess.forEach(function (b) { const s = b.CurrentStage || '—'; byStage[s] = (byStage[s] || 0) + 1; });
@@ -2501,7 +2615,7 @@ function renderBatches() {
       '<td data-label="MFD">' + escapeHtml(b.MFD) + '</td>' +
       '<td class="mono" data-label="Qty">' + escapeHtml(b.BatchQty || '—') + '</td>' +
       '<td data-label="Stage"><span class="status-pill">' + escapeHtml(b.CurrentStage) + '</span></td>' +
-      '<td data-label="Status"><span class="status-pill' + (b.Status === 'Complete' ? ' ok' : '') + '">' + escapeHtml(b.Status) + '</span></td>' +
+      '<td data-label="Status"><span class="status-pill' + statusPillClass(b.Status) + '">' + escapeHtml(b.Status) + '</span></td>' +
       '<td data-label="Created">' + created + '</td>' +
       '</tr>';
   }).join('');
@@ -2518,6 +2632,9 @@ function renderBatches() {
   }
 }
 
+function statusPillClass(status) {
+  return status === 'Complete' ? ' ok' : status === 'Rejected' ? ' bad' : status === 'On Hold' ? ' hold' : '';
+}
 function fmtDate(d) { return d ? new Date(d).toLocaleDateString() : '—'; }
 function matchBatch(list, masterBatchNo) { return list.filter(function (e) { return e.MasterBatchNo === masterBatchNo; }); }
 function reportKv(label, value) {
@@ -2536,14 +2653,39 @@ function reportStage(label, rows, lineFn, extraHtml) {
   return '<div class="report-stage"><div class="report-stage-head"><h4>' + escapeHtml(label) + '</h4></div>' + body + (extraHtml || '') + '</div>';
 }
 
-// Batch report modal — pulls each stage's already-loaded entries for one
-// MasterBatchNo. Nothing is re-fetched; it's a client-side filter over
-// what enterApp() already loaded, so it opens instantly.
+// Batch report modal. It draws at once from the entries already loaded,
+// then again from the batch's own full record (getBatchRecord): the lists
+// hold only recent rows, so an older batch would otherwise show stages as
+// not logged.
+function batchSourceFromState(no) {
+  return {
+    winding: matchBatch(state.windingEntries, no), spray: matchBatch(state.sprayEntries, no),
+    heatStab: matchBatch(state.heatStabEntries, no), shortClearing: matchBatch(state.scEntries, no),
+    scTesting: matchBatch(state.scTestResults, no), welding: matchBatch(state.wdEntries, no),
+    pouringCuring: matchBatch(state.pcEntries, no), electricalPacking: matchBatch(state.epEntries, no),
+    bdv: matchBatch(state.bdEntries, no), finalQa: matchBatch(state.finalQaResults, no), skips: matchBatch(state.stageSkips, no)
+  };
+}
+function batchSource(no) {
+  return state.batchRecord && state.batchRecord.masterBatchNo === no ? state.batchRecord : batchSourceFromState(no);
+}
+
 function openBatchReport(masterBatchNo) {
   const b = state.batches.filter(function (x) { return x.MasterBatchNo === masterBatchNo; })[0];
   if (!b) return;
   state.openBatchNo = masterBatchNo;
+  state.batchRecord = null;
+  renderBatchReport(b, batchSourceFromState(masterBatchNo));
+  document.getElementById('batchReportOverlay').classList.remove('hidden');
+  eleApi('getBatchRecord', { masterBatchNo: masterBatchNo }).then(function (rec) {
+    if (state.openBatchNo !== masterBatchNo || !rec) return;
+    state.batchRecord = rec;
+    renderBatchReport(b, rec);
+  }).catch(function (err) { console.error(err); });
+}
 
+function renderBatchReport(b, src) {
+  const masterBatchNo = b.MasterBatchNo;
   document.getElementById('brMasterBatchNo').textContent = b.MasterBatchNo;
   document.getElementById('brSubline').textContent = b.FGCode + ' — ' + (b.CustomerName || 'No customer');
 
@@ -2552,32 +2694,46 @@ function openBatchReport(masterBatchNo) {
     reportKv('MFD', b.MFD) + reportKv('Voltage', b.Voltage) +
     reportKv('Batch Qty', b.BatchQty) + reportKv('Drawing No', b.DrawingNo) +
     reportKv('Created By', b.CreatedBy) + reportKv('Created', fmtDate(b.CreatedDate)) +
+    reportKv('QA Verdict', b.QAVerdict) + reportKv('Completed', b.CompletedDate ? fmtDate(b.CompletedDate) : '') +
     '</div>';
 
-  html += reportStage('Winding', matchBatch(state.windingEntries, masterBatchNo), function (e) {
+  html += reportStage('Winding', src.winding, function (e) {
     return fmtDate(e.Date) + ' · Shift ' + (e.Shift || '—') + ' · ' + (e.MCNo || '—') +
       ' — Total ' + (e.TotalQty || '—') + ', Bins ' + (e.BinsQty || '—') + ' · ' + (e.OperatorName || '—');
   });
-  html += reportStage('Spray & Core Cleaning', matchBatch(state.sprayEntries, masterBatchNo), productionLine);
-  html += reportStage('Heat Stabilization', matchBatch(state.heatStabEntries, masterBatchNo), productionLine);
+  html += reportStage('Spray & Core Cleaning', src.spray, productionLine);
+  html += reportStage('Heat Stabilization', src.heatStab, productionLine);
 
-  const scTest = matchBatch(state.scTestResults, masterBatchNo);
-  const scExtra = scTest.map(function (t) {
+  const scExtra = src.scTesting.map(function (t) {
     return '<div class="report-line">' + escapeHtml(t.RoundType + ' — Total ' + (t.TotalQty || '—') + ', Good ' + (t.GoodQty || '—') + ', Rejection ' + (t.RejectionPct || '—') + '%') + '</div>';
   }).join('');
-  html += reportStage('Short Clearing', matchBatch(state.scEntries, masterBatchNo), productionLine, scExtra);
+  html += reportStage('Short Clearing', src.shortClearing, productionLine, scExtra);
 
-  html += reportStage('Welding', matchBatch(state.wdEntries, masterBatchNo), productionLine);
-  html += reportStage('Pouring & Curing', matchBatch(state.pcEntries, masterBatchNo), productionLine);
-  html += reportStage('Electrical Testing & Packing', matchBatch(state.epEntries, masterBatchNo), productionLine);
-  html += reportStage('BDV & Final Testing', matchBatch(state.bdEntries, masterBatchNo), productionLine);
+  html += reportStage('Welding', src.welding, productionLine);
+  const pourSkip = (src.skips || []).filter(function (k) { return k.Stage === 'Pouring & Curing'; })[0];
+  if (src.pouringCuring.length === 0 && pourSkip) {
+    html += reportStage('Pouring & Curing', [pourSkip], function (k) {
+      return 'Not applicable — marked by ' + (k.By || '—') + ' on ' + fmtDate(k.Date) + (k.Reason ? ' · ' + k.Reason : '');
+    });
+  } else {
+    html += reportStage('Pouring & Curing', src.pouringCuring, productionLine);
+  }
+  html += reportStage('Electrical Testing & Packing', src.electricalPacking, productionLine);
+  html += reportStage('BDV & Final Testing', src.bdv, productionLine);
 
-  html += reportStage('Final QA', matchBatch(state.finalQaResults, masterBatchNo), function (r) {
-    return r.TestType + ' — Sample ' + r.SampleID + ': ' + (r.Reading || '—') + (r.FOAInspectorName ? ' · FOA: ' + r.FOAInspectorName : '');
+  html += reportStage('Final QA', src.finalQa, function (r) {
+    return r.TestType + ' — Sample ' + r.SampleID + ': ' + (r.Reading || '—') + (r.FOAInspectorName ? ' · FOA: ' + r.FOAInspectorName : '') +
+      (r.Verdict ? ' · ' + r.Verdict : '');
   });
 
+  // An Admin can take back the batch's latest stage entry (voidLastStage_).
+  if (state.who && state.who.isAdmin && b.CurrentStage && b.CurrentStage !== 'Winding') {
+    html += '<div class="report-stage"><div class="report-stage-head"><h4>Correct a mistake</h4></div>' +
+      '<div class="report-line">Voids the ' + escapeHtml(b.CurrentStage) + ' entry and steps the batch back, so the stage can be entered again. Admin only.</div>' +
+      '<button type="button" class="btn-ghost" id="brVoidBtn" style="margin-top:6px">Void the ' + escapeHtml(b.CurrentStage) + ' entry</button></div>';
+  }
+
   document.getElementById('brBody').innerHTML = html;
-  document.getElementById('batchReportOverlay').classList.remove('hidden');
 }
 function closeBatchReport() { document.getElementById('batchReportOverlay').classList.add('hidden'); state.openBatchNo = null; }
 
@@ -2589,19 +2745,21 @@ function exportBatchReport() {
   const masterBatchNo = state.openBatchNo;
   const b = state.batches.filter(function (x) { return x.MasterBatchNo === masterBatchNo; })[0];
   if (!b) return;
+  const src = batchSource(masterBatchNo);
   const sections = [
     { title: 'Batch', columns: BATCH_COLUMNS, rows: [b] },
-    { title: 'Winding', columns: WINDING_COLUMNS, rows: matchBatch(state.windingEntries, masterBatchNo) },
-    { title: 'Spray & Core Cleaning', columns: SPRAY_COLUMNS, rows: matchBatch(state.sprayEntries, masterBatchNo) },
-    { title: 'Heat Stabilization', columns: HEATSTAB_COLUMNS, rows: matchBatch(state.heatStabEntries, masterBatchNo) },
-    { title: 'Short Clearing', columns: SC_COLUMNS, rows: matchBatch(state.scEntries, masterBatchNo) },
-    { title: 'Short Clearing Testing', columns: SC_TESTING_COLUMNS, rows: matchBatch(state.scTestResults, masterBatchNo) },
-    { title: 'Welding', columns: WD_COLUMNS, rows: matchBatch(state.wdEntries, masterBatchNo) },
-    { title: 'Pouring & Curing', columns: PC_COLUMNS, rows: matchBatch(state.pcEntries, masterBatchNo) },
-    { title: 'Electrical Testing & Packing', columns: EP_COLUMNS, rows: matchBatch(state.epEntries, masterBatchNo) },
-    { title: 'BDV & Final Testing', columns: BD_COLUMNS, rows: matchBatch(state.bdEntries, masterBatchNo) },
-    { title: 'Final QA', columns: FQ_COLUMNS, rows: matchBatch(state.finalQaResults, masterBatchNo) }
+    { title: 'Winding', columns: WINDING_COLUMNS, rows: src.winding },
+    { title: 'Spray & Core Cleaning', columns: SPRAY_COLUMNS, rows: src.spray },
+    { title: 'Heat Stabilization', columns: HEATSTAB_COLUMNS, rows: src.heatStab },
+    { title: 'Short Clearing', columns: SC_COLUMNS, rows: src.shortClearing },
+    { title: 'Short Clearing Testing', columns: SC_TESTING_COLUMNS, rows: src.scTesting },
+    { title: 'Welding', columns: WD_COLUMNS, rows: src.welding },
+    { title: 'Pouring & Curing', columns: PC_COLUMNS, rows: src.pouringCuring },
+    { title: 'Electrical Testing & Packing', columns: EP_COLUMNS, rows: src.electricalPacking },
+    { title: 'BDV & Final Testing', columns: BD_COLUMNS, rows: src.bdv },
+    { title: 'Final QA', columns: FQ_COLUMNS, rows: src.finalQa }
   ];
+  if ((src.skips || []).length) sections.push({ title: 'Not applicable', columns: SKIP_COLUMNS, rows: src.skips });
   if (!xlsxReady()) {
     downloadCsv(sectionsToCsv(sections), 'ele-tracker-' + masterBatchNo + '-full-report-' + todayStr() + '.csv');
     toast('Excel styling unavailable — exported CSV instead.', true);
@@ -2717,10 +2875,13 @@ function populateBatchDropdown() {
     ? bdReady.map(function (b) { return '<option value="' + escapeHtml(b.MasterBatchNo) + '">' + escapeHtml(b.MasterBatchNo) + ' — ' + escapeHtml(b.FGCode) + '</option>'; }).join('')
     : '<option value="">No batches ready for BDV &amp; Final Testing</option>';
 
-  const fqReady = state.batches.filter(function (b) { return b.CurrentStage === 'BDV & Final Testing' && b.Status === 'In Process'; });
+  // A batch put on hold at Final QA is tested again from here.
+  const fqReady = state.batches.filter(function (b) {
+    return (b.CurrentStage === 'BDV & Final Testing' && b.Status === 'In Process') || (b.CurrentStage === 'Final QA' && b.Status === 'On Hold');
+  });
   const fqSel = document.getElementById('fqMasterBatchNo');
   fqSel.innerHTML = fqReady.length
-    ? fqReady.map(function (b) { return '<option value="' + escapeHtml(b.MasterBatchNo) + '">' + escapeHtml(b.MasterBatchNo) + ' — ' + escapeHtml(b.FGCode) + '</option>'; }).join('')
+    ? fqReady.map(function (b) { return '<option value="' + escapeHtml(b.MasterBatchNo) + '">' + escapeHtml(b.MasterBatchNo) + ' — ' + escapeHtml(b.FGCode) + (b.Status === 'On Hold' ? ' (on hold, retest)' : '') + '</option>'; }).join('')
     : '<option value="">No batches ready for Final QA</option>';
 }
 
@@ -2943,6 +3104,30 @@ document.getElementById('batchesTableBody').addEventListener('click', function (
 });
 document.getElementById('brCloseBtn').addEventListener('click', closeBatchReport);
 document.getElementById('brExportBtn').addEventListener('click', exportBatchReport);
+// Admin only (the backend checks too). The entry's rows stay in the sheet,
+// marked void, and the batch steps back so the stage can be entered again.
+// The button is drawn with the report, so the click is caught on its body.
+document.getElementById('brBody').addEventListener('click', async function (e) {
+  const btn = e.target.closest('#brVoidBtn');
+  if (!btn) return;
+  const no = state.openBatchNo;
+  const b = state.batches.filter(function (x) { return x.MasterBatchNo === no; })[0];
+  if (!b) return;
+  const reason = window.prompt('Void the ' + b.CurrentStage + ' entry for ' + no + '?\n\n' +
+    'Its rows stay in the sheet, marked void, and the batch steps back so the stage can be entered again. Why is it being voided?');
+  if (reason === null) return;
+  if (!reason.trim()) { toast('Say why the entry is being voided.', true); return; }
+  setBtnLoading(btn, 'Voiding…', true);
+  try {
+    const result = await eleApi('voidLastStage', { masterBatchNo: no, stage: b.CurrentStage, reason: reason.trim() });
+    toast(result.voidedStage + ' voided — ' + no + ' is back at ' + result.currentStage + '.', false, 6000);
+    await loadEverything();
+    if (state.openBatchNo === no) openBatchReport(no);
+  } catch (err) {
+    toast(err.message, true);
+    clearBtnLoading(btn);
+  }
+});
 document.getElementById('batchReportOverlay').addEventListener('click', function (e) {
   if (e.target === this) closeBatchReport();
 });
@@ -3022,7 +3207,7 @@ document.getElementById('createBatchForm').addEventListener('submit', async func
     document.getElementById('createBatchForm').reset();
     document.getElementById('cbDate').value = todayStr();
     buildFilmLoadGrid();
-    toast('Created ' + result.masterBatchNo);
+    savedToast(result, 'Created ' + result.masterBatchNo);
     await loadBatches();
   } catch (err) { errEl.textContent = err.message; }
   finally { clearBtnLoading(btn, 'Create batch'); }
@@ -3057,7 +3242,7 @@ document.getElementById('logShiftForm').addEventListener('submit', async functio
   if (!masterBatchNo) { errEl.textContent = 'No batch selected.'; return; }
   setBtnLoading(btn, 'Logging…');
   try {
-    await eleApi('addWindingShift', {
+    const result = await eleApi('addWindingShift', {
       masterBatchNo: masterBatchNo,
       date: document.getElementById('lsDate').value,
       shift: document.getElementById('lsShift').value,
@@ -3071,7 +3256,7 @@ document.getElementById('logShiftForm').addEventListener('submit', async functio
     });
     document.getElementById('logShiftForm').reset();
     document.getElementById('lsDate').value = todayStr();
-    toast('Shift logged — ' + masterBatchNo);
+    savedToast(result, 'Shift logged — ' + masterBatchNo);
     await loadWindingEntries();
   } catch (err) { errEl.textContent = err.message; }
   finally { clearBtnLoading(btn, 'Log shift'); }
@@ -3102,7 +3287,7 @@ document.getElementById('sprayForm').addEventListener('submit', async function (
   setBtnLoading(btn, 'Logging…');
   try {
     const readings = collectSprayReadings();
-    await eleApi('enterSpray', Object.assign({
+    const result = await eleApi('enterSpray', Object.assign({
       masterBatchNo: masterBatchNo,
       date: document.getElementById('spDate').value,
       shift: document.getElementById('spShift').value,
@@ -3122,7 +3307,7 @@ document.getElementById('sprayForm').addEventListener('submit', async function (
     document.getElementById('sprayForm').reset();
     document.getElementById('spDate').value = todayStr();
     buildSprayReadingsGrid();
-    toast('Spray logged — ' + masterBatchNo);
+    savedToast(result, 'Spray logged — ' + masterBatchNo);
     await Promise.all([loadBatches(), loadSprayEntries()]);
   } catch (err) { errEl.textContent = err.message; }
   finally { clearBtnLoading(btn, 'Log Spray'); }
@@ -3144,7 +3329,7 @@ document.getElementById('heatStabForm').addEventListener('submit', async functio
   if (!masterBatchNo) { errEl.textContent = 'No batch selected.'; return; }
   setBtnLoading(btn, 'Logging…');
   try {
-    await eleApi('enterHeatStab', {
+    const result = await eleApi('enterHeatStab', {
       masterBatchNo: masterBatchNo,
       date: document.getElementById('hsDate').value,
       shift: document.getElementById('hsShift').value,
@@ -3161,7 +3346,7 @@ document.getElementById('heatStabForm').addEventListener('submit', async functio
     });
     document.getElementById('heatStabForm').reset();
     document.getElementById('hsDate').value = todayStr();
-    toast('Heat Stabilization logged — ' + masterBatchNo);
+    savedToast(result, 'Heat Stabilization logged — ' + masterBatchNo);
     await Promise.all([loadBatches(), loadHeatStabEntries()]);
   } catch (err) { errEl.textContent = err.message; }
   finally { clearBtnLoading(btn, 'Log Heat Stabilization'); }
@@ -3183,7 +3368,7 @@ document.getElementById('shortClearingForm').addEventListener('submit', async fu
   if (!masterBatchNo) { errEl.textContent = 'No batch selected.'; return; }
   setBtnLoading(btn, 'Logging…');
   try {
-    await eleApi('enterShortClearing', {
+    const result = await eleApi('enterShortClearing', {
       masterBatchNo: masterBatchNo,
       date: document.getElementById('scDate').value,
       shift: document.getElementById('scShift').value,
@@ -3213,7 +3398,7 @@ document.getElementById('shortClearingForm').addEventListener('submit', async fu
     document.getElementById('shortClearingForm').reset();
     document.getElementById('scDate').value = todayStr();
     buildScTestingGrid();
-    toast('Short Clearing logged — ' + masterBatchNo);
+    savedToast(result, 'Short Clearing logged — ' + masterBatchNo);
     await Promise.all([loadBatches(), loadScEntries(), loadScTestResults()]);
   } catch (err) { errEl.textContent = err.message; }
   finally { clearBtnLoading(btn, 'Log Short Clearing'); }
@@ -3242,7 +3427,7 @@ document.getElementById('weldingForm').addEventListener('submit', async function
   if (!masterBatchNo) { errEl.textContent = 'No batch selected.'; return; }
   setBtnLoading(btn, 'Logging…');
   try {
-    await eleApi('enterWelding', {
+    const result = await eleApi('enterWelding', {
       masterBatchNo: masterBatchNo,
       date: document.getElementById('wdDate').value,
       shift: document.getElementById('wdShift').value,
@@ -3264,7 +3449,7 @@ document.getElementById('weldingForm').addEventListener('submit', async function
     });
     document.getElementById('weldingForm').reset();
     document.getElementById('wdDate').value = todayStr();
-    toast('Welding logged — ' + masterBatchNo);
+    savedToast(result, 'Welding logged — ' + masterBatchNo);
     await Promise.all([loadBatches(), loadWdEntries()]);
   } catch (err) { errEl.textContent = err.message; }
   finally { clearBtnLoading(btn, 'Log Welding'); }
@@ -3286,7 +3471,7 @@ document.getElementById('pouringCuringForm').addEventListener('submit', async fu
   if (!masterBatchNo) { errEl.textContent = 'No batch selected.'; return; }
   setBtnLoading(btn, 'Logging…');
   try {
-    await eleApi('enterPouringCuring', {
+    const result = await eleApi('enterPouringCuring', {
       masterBatchNo: masterBatchNo,
       date: document.getElementById('pcDate').value,
       shift: document.getElementById('pcShift').value,
@@ -3303,7 +3488,7 @@ document.getElementById('pouringCuringForm').addEventListener('submit', async fu
     });
     document.getElementById('pouringCuringForm').reset();
     document.getElementById('pcDate').value = todayStr();
-    toast('Pouring & Curing logged — ' + masterBatchNo);
+    savedToast(result, 'Pouring & Curing logged — ' + masterBatchNo);
     await Promise.all([loadBatches(), loadPcEntries()]);
   } catch (err) { errEl.textContent = err.message; }
   finally { clearBtnLoading(btn, 'Log Pouring & Curing'); }
@@ -3316,6 +3501,29 @@ document.getElementById('exportPcBtn').addEventListener('click', function () {
   openExportPicker(state.pcEntries, PC_COLUMNS, 'ele-tracker-pouring-curing', 'Pouring & Curing');
 });
 
+// A batch that isn't poured moves on without a dummy Pouring entry. The
+// skip is logged with who marked it and the Remarks as its reason.
+document.getElementById('pouringCuringSkip').addEventListener('click', async function () {
+  const btn = this;
+  const errEl = document.getElementById('pouringCuringError');
+  errEl.textContent = '';
+  const masterBatchNo = document.getElementById('pcMasterBatchNo').value;
+  if (!masterBatchNo) { errEl.textContent = 'No batch selected.'; return; }
+  if (!window.confirm('Mark Pouring & Curing not applicable for ' + masterBatchNo + '?\n\n' +
+                      'The batch moves on to Electrical Testing & Packing with no pouring entry. Anything in Remarks is kept as the reason.')) return;
+  setBtnLoading(btn, 'Saving…', true);
+  try {
+    const result = await eleApi('skipStage', {
+      masterBatchNo: masterBatchNo, stage: 'Pouring & Curing', reason: document.getElementById('pcRemarks').value.trim()
+    });
+    document.getElementById('pouringCuringForm').reset();
+    document.getElementById('pcDate').value = todayStr();
+    savedToast(result, 'Pouring & Curing marked not applicable — ' + masterBatchNo);
+    await Promise.all([loadBatches(), loadStageSkips()]);
+  } catch (err) { errEl.textContent = err.message; }
+  finally { clearBtnLoading(btn, 'Not applicable for this batch'); }
+});
+
 document.getElementById('electricalPackingForm').addEventListener('submit', async function (e) {
   e.preventDefault();
   const btn = document.getElementById('electricalPackingSubmit');
@@ -3325,7 +3533,7 @@ document.getElementById('electricalPackingForm').addEventListener('submit', asyn
   if (!masterBatchNo) { errEl.textContent = 'No batch selected.'; return; }
   setBtnLoading(btn, 'Logging…');
   try {
-    await eleApi('enterElectricalPacking', {
+    const result = await eleApi('enterElectricalPacking', {
       masterBatchNo: masterBatchNo,
       date: document.getElementById('epDate').value,
       shift: document.getElementById('epShift').value,
@@ -3347,7 +3555,7 @@ document.getElementById('electricalPackingForm').addEventListener('submit', asyn
     });
     document.getElementById('electricalPackingForm').reset();
     document.getElementById('epDate').value = todayStr();
-    toast('Electrical Testing & Packing logged — ' + masterBatchNo);
+    savedToast(result, 'Electrical Testing & Packing logged — ' + masterBatchNo);
     await Promise.all([loadBatches(), loadEpEntries()]);
   } catch (err) { errEl.textContent = err.message; }
   finally { clearBtnLoading(btn, 'Log Electrical Testing & Packing'); }
@@ -3369,7 +3577,7 @@ document.getElementById('bdvForm').addEventListener('submit', async function (e)
   if (!masterBatchNo) { errEl.textContent = 'No batch selected.'; return; }
   setBtnLoading(btn, 'Logging…');
   try {
-    await eleApi('enterBDV', {
+    const result = await eleApi('enterBDV', {
       masterBatchNo: masterBatchNo,
       date: document.getElementById('bdDate').value,
       shift: document.getElementById('bdShift').value,
@@ -3397,7 +3605,7 @@ document.getElementById('bdvForm').addEventListener('submit', async function (e)
     });
     document.getElementById('bdvForm').reset();
     document.getElementById('bdDate').value = todayStr();
-    toast('BDV & Final Testing logged — ' + masterBatchNo);
+    savedToast(result, 'BDV & Final Testing logged — ' + masterBatchNo);
     await Promise.all([loadBatches(), loadBdEntries()]);
   } catch (err) { errEl.textContent = err.message; }
   finally { clearBtnLoading(btn, 'Log BDV & Final Testing'); }
@@ -3419,17 +3627,20 @@ document.getElementById('finalQaForm').addEventListener('submit', async function
   if (!masterBatchNo) { errEl.textContent = 'No batch selected.'; return; }
   const results = collectFinalQaResults();
   if (results.length === 0) { errEl.textContent = 'Enter at least one test type and reading.'; return; }
+  const verdict = document.getElementById('fqVerdict').value;
+  if (!verdict) { errEl.textContent = 'Pick the verdict: Pass, Hold or Reject.'; return; }
   setBtnLoading(btn, 'Submitting…');
   try {
-    await eleApi('submitFinalQA', {
+    const result = await eleApi('submitFinalQA', {
       masterBatchNo: masterBatchNo,
       results: results,
+      verdict: verdict,
       foaInspectorName: document.getElementById('fqFoaInspectorName').value.trim(),
       notes: document.getElementById('fqNotes').value.trim()
     });
     document.getElementById('finalQaForm').reset();
     buildFinalQaGrid();
-    toast('Final QA submitted — ' + masterBatchNo + ' marked Complete');
+    savedToast(result, 'Final QA saved — ' + masterBatchNo + ' is ' + (result && result.status ? result.status : 'saved'));
     await Promise.all([loadBatches(), loadFinalQaResults()]);
   } catch (err) { errEl.textContent = err.message; }
   finally { clearBtnLoading(btn, 'Submit Final QA'); }
