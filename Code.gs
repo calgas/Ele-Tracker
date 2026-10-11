@@ -18,7 +18,9 @@
  * Every write runs under a single script lock per request (see WRITE LOCK).
  * A stage's "is this batch at the right prior stage" check and the write
  * that depends on it therefore can't interleave with another device's
- * submission for the same batch.
+ * submission for the same batch. A write that carries a clientTxnId is
+ * recorded against it, so a resend after a lost reply gets the first
+ * answer back instead of saving twice (see IDEMPOTENCY).
  *
  * The mid-chain stages, Spray through BDV, share one shape — look the batch
  * up, confirm its prior stage, log the entry, advance — factored into
@@ -81,6 +83,23 @@ var STAGE_ACCESS_DEFAULT = [
 
 var CODE_SEQUENCES_HEADERS = ['Key', 'Prefix', 'FY', 'LastNumber'];
 
+// How many of the newest rows a get…Entries read returns when the app
+// doesn't say. The lists load every 45 seconds on every open device, so
+// they must not grow with the sheet for ever. A batch's own report reads
+// all its rows (getBatchRecord), whatever its age.
+var ENTRIES_DEFAULT_LIMIT = 2000;
+var ENTRIES_MAX_LIMIT = 10000;
+
+// Duplicate protection: how far back a resent clientTxnId is looked for.
+// A resend comes seconds or minutes after the original, so the newest
+// rows are enough and the check stays fast as the tab grows.
+var IDEMPOTENCY_TAB = 'Idempotency';
+var IDEMPOTENCY_SCAN_ROWS = 2000;
+
+// A voided entry stays in its tab, marked with these, so the record of
+// what was entered and who took it back is never lost.
+var VOID_COLUMNS = ['Voided', 'VoidedBy', 'VoidedAt', 'VoidReason'];
+
 // Every tab this project owns, with headers — used by ADMIN_setupSheet
 // (bottom of file) to create any tab that's missing. Safe to leave here
 // even though the sheet is already set up: re-running it is a no-op.
@@ -100,7 +119,7 @@ var ELE_TAB_SCHEMA = {
     'InputMaterialThicknessMicron', 'InputMaterialWidth', 'TypeOfFilm', 'WaveCut', 'FreeMargin',
     'MPPFilmTurns', 'Resistivity', 'WrappingTurns', 'ReDie', 'CanSize', 'BarrierHeightTurns',
     'CoreLength', 'CoreOD', 'FilmSticker1_URL', 'FilmSticker2_URL', 'CurrentStage', 'Status',
-    'CreatedDate', 'CreatedBy'
+    'CreatedDate', 'CreatedBy', 'QAVerdict', 'CompletedDate'
   ],
   'FilmLoadReadings': ['MasterBatchNo', 'SNo', 'Reading1', 'Reading2', 'Reading3', 'Reading4'],
   'Winding': ['MasterBatchNo', 'Date', 'Shift', 'MCNo', 'TotalQty', 'BinsQty', 'OperatorName', 'Remarks', 'ProdSupervisor', 'PQA'],
@@ -133,11 +152,19 @@ var ELE_TAB_SCHEMA = {
     'PrintingVerifiedBy', 'InnerBoxWeightKgs', 'MasterBoxWeightKgs', 'CapacitorsPerBox', 'TotalBoxes',
     'VisualInspectionSampleSize', 'ElectricalInspectionSampleSize', 'TotalQty', 'GoodQty', 'RejectQty', 'TraysQty', 'BinsQty', 'OperatorName', 'Remarks'
   ],
-  'FinalQA_Results': ['MasterBatchNo', 'TestType', 'SampleID', 'Reading', 'FOAInspectorName', 'Notes'],
+  'FinalQA_Results': ['MasterBatchNo', 'TestType', 'SampleID', 'Reading', 'FOAInspectorName', 'Notes', 'Date', 'Verdict'],
+  'Stage_Skips': ['MasterBatchNo', 'Stage', 'Date', 'By', 'Reason'],
   'Code_Sequences': CODE_SEQUENCES_HEADERS,
   'AuditLog': ['Timestamp', 'User', 'Action', 'Module', 'RecordID', 'OldValue', 'NewValue'],
-  'Stage_Access': ['Stage', 'Departments']
+  'Stage_Access': ['Stage', 'Departments'],
+  'Idempotency': ['ClientTxnId', 'Action', 'User', 'Timestamp', 'Result']
 };
+
+// Every tab that holds stage entries can have one voided.
+['Winding', 'PaperMaskingSpray', 'HeatStabilization', 'ShortClearing', 'ShortClearing_Testing', 'Welding',
+ 'PouringCuring', 'PouringElectricalPacking', 'BDVFinalTesting', 'FinalQA_Results', 'Stage_Skips'].forEach(function (t) {
+  ELE_TAB_SCHEMA[t] = ELE_TAB_SCHEMA[t].concat(VOID_COLUMNS);
+});
 
 // ============================================================
 // UTILS — generic sheet helpers
@@ -147,18 +174,48 @@ function jsonResponse_(payload) {
   return ContentService.createTextOutput(JSON.stringify(payload)).setMimeType(ContentService.MimeType.JSON);
 }
 
-function headerIndexMap_(sheet) {
-  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+// A tab's header row, read once per execution and reused. Every append
+// and lookup used to read it again, which made a Final QA submission
+// about fifty sheet calls while every other device waited on the lock.
+// Anything that adds a column clears it (ensureColumns_).
+var _sheetMetaCache_ = {};
+function sheetMeta_(sheet) {
+  var key = sheet.getParent().getId() + '!' + sheet.getSheetId();
+  if (_sheetMetaCache_[key]) return _sheetMetaCache_[key];
+  var lastCol = sheet.getLastColumn();
+  var headers = lastCol > 0 ? sheet.getRange(1, 1, 1, lastCol).getValues()[0] : [];
   var map = {};
   headers.forEach(function (h, i) { if (h) map[h] = i; });
-  return map;
+  var meta = { map: map, headers: headers, lastCol: lastCol };
+  _sheetMetaCache_[key] = meta;
+  return meta;
+}
+
+function invalidateSheetMeta_(sheet) {
+  delete _sheetMetaCache_[sheet.getParent().getId() + '!' + sheet.getSheetId()];
+}
+
+// Adds any of these headers the tab doesn't have yet, at the end, so a tab
+// set up before a column existed gains it on first use. Never moves or
+// renames a column.
+function ensureColumns_(sheet, names) {
+  var meta = sheetMeta_(sheet);
+  var missing = names.filter(function (n) { return meta.map[n] === undefined; });
+  if (missing.length === 0) return;
+  sheet.getRange(1, meta.lastCol + 1, 1, missing.length).setValues([missing]);
+  invalidateSheetMeta_(sheet);
+}
+
+function headerIndexMap_(sheet) {
+  return sheetMeta_(sheet).map;
 }
 
 function readSheetAsObjects_(sheet) {
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) return [];
-  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-  var values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+  var meta = sheetMeta_(sheet);
+  var headers = meta.headers;
+  var values = sheet.getRange(2, 1, lastRow - 1, meta.lastCol).getValues();
   return values.map(function (row) {
     var obj = {};
     headers.forEach(function (h, i) { if (h) obj[h] = row[i]; });
@@ -190,13 +247,40 @@ function parseDay_(v) {
   return m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : new Date(v);
 }
 
-function appendRowByHeader_(sheet, rowObj) {
-  var map = headerIndexMap_(sheet);
-  var row = new Array(sheet.getLastColumn()).fill('');
+function rowFromObject_(meta, rowObj) {
+  var row = new Array(meta.lastCol).fill('');
   Object.keys(rowObj).forEach(function (key) {
-    if (map[key] !== undefined) row[map[key]] = sheetSafe_(rowObj[key]);
+    if (meta.map[key] !== undefined) row[meta.map[key]] = sheetSafe_(rowObj[key]);
   });
-  sheet.appendRow(row);
+  return row;
+}
+
+function appendRowByHeader_(sheet, rowObj) {
+  sheet.appendRow(rowFromObject_(sheetMeta_(sheet), rowObj));
+}
+
+// Several rows in one write — a Final QA grid or a set of test rounds —
+// rather than one call per row while the lock is held.
+function appendRowsByHeader_(sheet, rowObjs) {
+  if (!rowObjs.length) return;
+  var meta = sheetMeta_(sheet);
+  var rows = rowObjs.map(function (o) { return rowFromObject_(meta, o); });
+  sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, meta.lastCol).setValues(rows);
+}
+
+function isVoided_(r) {
+  return r.Voided === true || String(r.Voided).toUpperCase() === 'TRUE';
+}
+
+// The newest rows of a stage tab, voided entries left out. Rows are
+// appended in time order, so the newest are at the bottom.
+function readEntries_(tabName, params, sortByDate) {
+  var rows = readSheetAsObjects_(SpreadsheetApp.getActiveSpreadsheet().getSheetByName(tabName))
+    .filter(function (r) { return !isVoided_(r); });
+  var limit = Math.min(Number(params && params.limit) || ENTRIES_DEFAULT_LIMIT, ENTRIES_MAX_LIMIT);
+  if (rows.length > limit) rows = rows.slice(rows.length - limit);
+  if (sortByDate) rows.sort(function (a, b) { return new Date(b.Date).getTime() - new Date(a.Date).getTime(); });
+  return rows;
 }
 
 // Who recorded what, and when. Created on first use, so a sheet set up
@@ -303,7 +387,10 @@ function validateSharedSession_(token) {
   var values = sheet.getRange(hit.getRow(), 1, 1, lastCol).getValues()[0];
   var session = {};
   headers.forEach(function (h, i) { if (h) session[h] = values[i]; });
-  if (new Date(session.ExpiresAt).getTime() < Date.now()) return null;
+  // A blank or unreadable ExpiresAt counts as expired. new Date('') is
+  // NaN, and NaN < now is false, so such a row used to never expire.
+  var expires = session.ExpiresAt ? new Date(session.ExpiresAt).getTime() : NaN;
+  if (isNaN(expires) || expires < Date.now()) return null;
   return session;
 }
 
@@ -326,8 +413,10 @@ function readStageAccess_() {
     return String(text || '').split(',').map(function (d) { return d.trim(); }).filter(Boolean);
   };
   STAGE_ACCESS_DEFAULT.forEach(function (r) { map[r[0]] = split(r[1]); });
+  // A missing tab (renamed, or setup never run) leaves the defaults above
+  // in force, rather than failing every request, sign-in included.
   var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Stage_Access');
-  readSheetAsObjects_(sheet).forEach(function (r) {
+  if (sheet) readSheetAsObjects_(sheet).forEach(function (r) {
     var stage = String(r.Stage || '').trim();
     if (stage && map[stage] !== undefined) map[stage] = split(r.Departments);
   });
@@ -409,7 +498,10 @@ function withWriteLock_(fn) {
 // {Machine}_{MFD}_{Date}_{serial} vs. others).
 // ============================================================
 
-// "25-26" for any date between 1 Apr 2025 and 31 Mar 2026.
+// "25-26" for any date between 1 Apr 2025 and 31 Mar 2026. Dates here are
+// in the script's time zone, so the project must be set to Asia/Kolkata
+// (Project Settings) for the year to roll over at Indian midnight on
+// 1 April; ADMIN_setupSheet says if it isn't.
 function getCurrentFY_() {
   var now = new Date();
   var year = now.getFullYear();
@@ -470,7 +562,8 @@ function getBatchRow_(masterBatchNo) {
     sheet: sheet,
     rowIdx: rowIdx,
     map: map,
-    currentStage: sheet.getRange(rowIdx, map['CurrentStage'] + 1).getValue()
+    currentStage: sheet.getRange(rowIdx, map['CurrentStage'] + 1).getValue(),
+    status: map['Status'] !== undefined ? sheet.getRange(rowIdx, map['Status'] + 1).getValue() : ''
   };
 }
 
@@ -484,6 +577,53 @@ function requireStage_(batch, expectedStage, stageLabel) {
 // Moves the batch forward to the next stage on the card.
 function advanceStage_(batch, newStage) {
   batch.sheet.getRange(batch.rowIdx, batch.map['CurrentStage'] + 1).setValue(newStage);
+}
+
+// Good + Reject can't come to more than Total: those three are what yield
+// and rejection figures are worked out from. Left blank, a count isn't
+// checked.
+function checkQuantities_(params) {
+  var n = function (v) { return v === undefined || v === null || String(v).trim() === '' ? null : Number(v); };
+  var total = n(params.totalQty), good = n(params.goodQty), reject = n(params.rejectQty);
+  [['Total', total], ['Good', good], ['Reject', reject]].forEach(function (pair) {
+    if (pair[1] !== null && (isNaN(pair[1]) || pair[1] < 0)) throw new Error(pair[0] + ' qty must be a number, 0 or more.');
+  });
+  if (total !== null && (good || 0) + (reject || 0) > total) {
+    throw new Error('Good (' + (good || 0) + ') + Reject (' + (reject || 0) + ') comes to more than Total (' + total + '). Check the counts.');
+  }
+}
+
+// A stage reporting more pieces than the stage before it passed as good is
+// usually a miscount, but rework can add pieces back, so it is saved and
+// the person told rather than refused. prevTabs: [tab, label] pairs; the
+// first with an entry for this batch is the one compared against (Pouring
+// & Curing, then Welding when Pouring was marked not applicable).
+function previousGoodWarning_(batch, params, prevTabs) {
+  var total = Number(params.totalQty);
+  if (params.totalQty === undefined || String(params.totalQty).trim() === '' || isNaN(total)) return '';
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  for (var i = 0; i < prevTabs.length; i++) {
+    var rows = readSheetAsObjects_(ss.getSheetByName(prevTabs[i][0])).filter(function (r) {
+      return String(r.MasterBatchNo) === batch.masterBatchNo && !isVoided_(r);
+    });
+    if (!rows.length) continue;
+    // Winding has no Good column: its shifts' totals are what it passed on.
+    var field = prevTabs[i][0] === 'Winding' ? 'TotalQty' : 'GoodQty';
+    var prev = 0, any = false;
+    rows.forEach(function (r) {
+      if (r[field] !== '' && r[field] !== null && !isNaN(Number(r[field]))) { prev += Number(r[field]); any = true; }
+    });
+    if (!any || total <= prev) return '';
+    return 'Total ' + total + ' is more than the ' + prev + (field === 'TotalQty' ? ' wound' : ' good') + ' at ' + prevTabs[i][1] +
+           '. Fine if that\u2019s rework; otherwise check the count.';
+  }
+  return '';
+}
+
+function stageResult_(batch, warning) {
+  var out = { masterBatchNo: batch.masterBatchNo };
+  if (warning) out.warning = warning;
+  return out;
 }
 
 // ============================================================
@@ -533,6 +673,7 @@ function createWindingBatch_(session, params) {
   if (!fgCode) throw new Error('FG code is required');
   if (!mcNo) throw new Error('Machine is required');
   if (!mfd) throw new Error('MFD is required');
+  checkQuantities_(params);
 
   var fg = readSheetAsObjects_(getStockSpreadsheet_().getSheetByName('FG_Master')).filter(function (r) { return r.FG_Code === fgCode; })[0];
   if (!fg) throw new Error('Unknown FG code: ' + fgCode);
@@ -577,13 +718,12 @@ function createWindingBatch_(session, params) {
 
   if (Array.isArray(params.filmLoadReadings)) {
     var flSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('FilmLoadReadings');
-    params.filmLoadReadings.forEach(function (r) {
-      if (!r.sNo) return;
-      appendRowByHeader_(flSheet, {
+    appendRowsByHeader_(flSheet, params.filmLoadReadings.filter(function (r) { return r && r.sNo; }).map(function (r) {
+      return {
         MasterBatchNo: masterBatchNo, SNo: r.sNo,
         Reading1: r.reading1 || '', Reading2: r.reading2 || '', Reading3: r.reading3 || '', Reading4: r.reading4 || ''
-      });
-    });
+      };
+    }));
   }
 
   appendWindingShift_(masterBatchNo, params);
@@ -592,15 +732,14 @@ function createWindingBatch_(session, params) {
 
 function addWindingShift_(session, params) {
   requireStageAccess_(session, 'enterWinding');
+  checkQuantities_(params);
   var batch = getBatchRow_(params.masterBatchNo);
   appendWindingShift_(batch.masterBatchNo, params);
   return { masterBatchNo: batch.masterBatchNo };
 }
 
-function getWindingEntries_() {
-  var rows = readSheetAsObjects_(SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Winding'));
-  rows.sort(function (a, b) { return new Date(b.Date).getTime() - new Date(a.Date).getTime(); });
-  return rows;
+function getWindingEntries_(params) {
+  return readEntries_('Winding', params, true);
 }
 
 function getBatchMasterList_() {
@@ -624,6 +763,8 @@ function enterSpray_(session, params) {
   requireStageAccess_(session, 'enterSpray');
   var batch = getBatchRow_(params.masterBatchNo);
   requireStage_(batch, 'Winding', 'Spray');
+  checkQuantities_(params);
+  var warning = previousGoodWarning_(batch, params, [['Winding', 'Winding']]);
 
   var rowObj = {
     MasterBatchNo: batch.masterBatchNo,
@@ -651,13 +792,11 @@ function enterSpray_(session, params) {
   appendRowByHeader_(SpreadsheetApp.getActiveSpreadsheet().getSheetByName('PaperMaskingSpray'), rowObj);
 
   advanceStage_(batch, 'Spray');
-  return { masterBatchNo: batch.masterBatchNo };
+  return stageResult_(batch, warning);
 }
 
-function getSprayEntries_() {
-  var rows = readSheetAsObjects_(SpreadsheetApp.getActiveSpreadsheet().getSheetByName('PaperMaskingSpray'));
-  rows.sort(function (a, b) { return new Date(b.Date).getTime() - new Date(a.Date).getTime(); });
-  return rows;
+function getSprayEntries_(params) {
+  return readEntries_('PaperMaskingSpray', params, true);
 }
 
 // ============================================================
@@ -668,6 +807,8 @@ function enterHeatStab_(session, params) {
   requireStageAccess_(session, 'enterHeatStab');
   var batch = getBatchRow_(params.masterBatchNo);
   requireStage_(batch, 'Spray', 'Heat Stabilization');
+  checkQuantities_(params);
+  var warning = previousGoodWarning_(batch, params, [['PaperMaskingSpray', 'Spray']]);
 
   appendRowByHeader_(SpreadsheetApp.getActiveSpreadsheet().getSheetByName('HeatStabilization'), {
     MasterBatchNo: batch.masterBatchNo,
@@ -686,13 +827,11 @@ function enterHeatStab_(session, params) {
   });
 
   advanceStage_(batch, 'Heat Stabilization');
-  return { masterBatchNo: batch.masterBatchNo };
+  return stageResult_(batch, warning);
 }
 
-function getHeatStabEntries_() {
-  var rows = readSheetAsObjects_(SpreadsheetApp.getActiveSpreadsheet().getSheetByName('HeatStabilization'));
-  rows.sort(function (a, b) { return new Date(b.Date).getTime() - new Date(a.Date).getTime(); });
-  return rows;
+function getHeatStabEntries_(params) {
+  return readEntries_('HeatStabilization', params, true);
 }
 
 // ============================================================
@@ -708,6 +847,8 @@ function enterShortClearing_(session, params) {
   requireStageAccess_(session, 'enterShortClearing');
   var batch = getBatchRow_(params.masterBatchNo);
   requireStage_(batch, 'Heat Stabilization', 'Short Clearing');
+  checkQuantities_(params);
+  var warning = previousGoodWarning_(batch, params, [['HeatStabilization', 'Heat Stabilization']]);
 
   appendRowByHeader_(SpreadsheetApp.getActiveSpreadsheet().getSheetByName('ShortClearing'), {
     MasterBatchNo: batch.masterBatchNo,
@@ -741,12 +882,11 @@ function enterShortClearing_(session, params) {
 
   if (Array.isArray(params.testingRounds)) {
     var testingSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('ShortClearing_Testing');
-    params.testingRounds.forEach(function (r) {
-      if (!r.roundType) return;
-      appendRowByHeader_(testingSheet, {
+    appendRowsByHeader_(testingSheet, params.testingRounds.filter(function (r) { return r && r.roundType; }).map(function (r) {
+      return {
         MasterBatchNo: batch.masterBatchNo,
         RoundType: r.roundType,
-        Date: r.date ? new Date(r.date) : new Date(),
+        Date: r.date ? parseDay_(r.date) : new Date(),
         TotalQty: r.totalQty || '',
         GoodQty: r.goodQty || '',
         HVBurst: r.hvBurst || '',
@@ -754,24 +894,20 @@ function enterShortClearing_(session, params) {
         CapMinus: r.capMinus || '',
         Tand: r.tand || '',
         RejectionPct: r.rejectionPct || ''
-      });
-    });
+      };
+    }));
   }
 
   advanceStage_(batch, 'Short Clearing');
-  return { masterBatchNo: batch.masterBatchNo };
+  return stageResult_(batch, warning);
 }
 
-function getShortClearingEntries_() {
-  var rows = readSheetAsObjects_(SpreadsheetApp.getActiveSpreadsheet().getSheetByName('ShortClearing'));
-  rows.sort(function (a, b) { return new Date(b.Date).getTime() - new Date(a.Date).getTime(); });
-  return rows;
+function getShortClearingEntries_(params) {
+  return readEntries_('ShortClearing', params, true);
 }
 
-function getShortClearingTestResults_() {
-  var rows = readSheetAsObjects_(SpreadsheetApp.getActiveSpreadsheet().getSheetByName('ShortClearing_Testing'));
-  rows.sort(function (a, b) { return new Date(b.Date).getTime() - new Date(a.Date).getTime(); });
-  return rows;
+function getShortClearingTestResults_(params) {
+  return readEntries_('ShortClearing_Testing', params, true);
 }
 
 // ============================================================
@@ -782,6 +918,8 @@ function enterWelding_(session, params) {
   requireStageAccess_(session, 'enterWelding');
   var batch = getBatchRow_(params.masterBatchNo);
   requireStage_(batch, 'Short Clearing', 'Welding');
+  checkQuantities_(params);
+  var warning = previousGoodWarning_(batch, params, [['ShortClearing', 'Short Clearing']]);
 
   appendRowByHeader_(SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Welding'), {
     MasterBatchNo: batch.masterBatchNo,
@@ -805,13 +943,11 @@ function enterWelding_(session, params) {
   });
 
   advanceStage_(batch, 'Welding');
-  return { masterBatchNo: batch.masterBatchNo };
+  return stageResult_(batch, warning);
 }
 
-function getWeldingEntries_() {
-  var rows = readSheetAsObjects_(SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Welding'));
-  rows.sort(function (a, b) { return new Date(b.Date).getTime() - new Date(a.Date).getTime(); });
-  return rows;
+function getWeldingEntries_(params) {
+  return readEntries_('Welding', params, true);
 }
 
 // ============================================================
@@ -823,6 +959,8 @@ function enterPouringCuring_(session, params) {
   requireStageAccess_(session, 'enterPouringCuring');
   var batch = getBatchRow_(params.masterBatchNo);
   requireStage_(batch, 'Welding', 'Pouring & Curing');
+  checkQuantities_(params);
+  var warning = previousGoodWarning_(batch, params, [['Welding', 'Welding']]);
 
   appendRowByHeader_(SpreadsheetApp.getActiveSpreadsheet().getSheetByName('PouringCuring'), {
     MasterBatchNo: batch.masterBatchNo,
@@ -841,13 +979,11 @@ function enterPouringCuring_(session, params) {
   });
 
   advanceStage_(batch, 'Pouring & Curing');
-  return { masterBatchNo: batch.masterBatchNo };
+  return stageResult_(batch, warning);
 }
 
-function getPouringCuringEntries_() {
-  var rows = readSheetAsObjects_(SpreadsheetApp.getActiveSpreadsheet().getSheetByName('PouringCuring'));
-  rows.sort(function (a, b) { return new Date(b.Date).getTime() - new Date(a.Date).getTime(); });
-  return rows;
+function getPouringCuringEntries_(params) {
+  return readEntries_('PouringCuring', params, true);
 }
 
 // ============================================================
@@ -860,6 +996,8 @@ function enterElectricalPacking_(session, params) {
   requireStageAccess_(session, 'enterElectricalPacking');
   var batch = getBatchRow_(params.masterBatchNo);
   requireStage_(batch, 'Pouring & Curing', 'Electrical Testing & Packing');
+  checkQuantities_(params);
+  var warning = previousGoodWarning_(batch, params, [['PouringCuring', 'Pouring & Curing'], ['Welding', 'Welding']]);
 
   appendRowByHeader_(SpreadsheetApp.getActiveSpreadsheet().getSheetByName('PouringElectricalPacking'), {
     MasterBatchNo: batch.masterBatchNo,
@@ -883,13 +1021,11 @@ function enterElectricalPacking_(session, params) {
   });
 
   advanceStage_(batch, 'Electrical Testing & Packing');
-  return { masterBatchNo: batch.masterBatchNo };
+  return stageResult_(batch, warning);
 }
 
-function getElectricalPackingEntries_() {
-  var rows = readSheetAsObjects_(SpreadsheetApp.getActiveSpreadsheet().getSheetByName('PouringElectricalPacking'));
-  rows.sort(function (a, b) { return new Date(b.Date).getTime() - new Date(a.Date).getTime(); });
-  return rows;
+function getElectricalPackingEntries_(params) {
+  return readEntries_('PouringElectricalPacking', params, true);
 }
 
 // ============================================================
@@ -903,6 +1039,8 @@ function enterBDV_(session, params) {
   requireStageAccess_(session, 'enterBDV');
   var batch = getBatchRow_(params.masterBatchNo);
   requireStage_(batch, 'Electrical Testing & Packing', 'BDV & Final Testing');
+  checkQuantities_(params);
+  var warning = previousGoodWarning_(batch, params, [['PouringElectricalPacking', 'Electrical Testing & Packing']]);
 
   appendRowByHeader_(SpreadsheetApp.getActiveSpreadsheet().getSheetByName('BDVFinalTesting'), {
     MasterBatchNo: batch.masterBatchNo,
@@ -932,13 +1070,11 @@ function enterBDV_(session, params) {
   });
 
   advanceStage_(batch, 'BDV & Final Testing');
-  return { masterBatchNo: batch.masterBatchNo };
+  return stageResult_(batch, warning);
 }
 
-function getBDVEntries_() {
-  var rows = readSheetAsObjects_(SpreadsheetApp.getActiveSpreadsheet().getSheetByName('BDVFinalTesting'));
-  rows.sort(function (a, b) { return new Date(b.Date).getTime() - new Date(a.Date).getTime(); });
-  return rows;
+function getBDVEntries_(params) {
+  return readEntries_('BDVFinalTesting', params, true);
 }
 
 // ============================================================
@@ -946,40 +1082,242 @@ function getBDVEntries_() {
 //
 // Different shape from every other stage — a test x sample grid (up to
 // 4 test types x up to 4 samples), not a single settings+shift row.
-// Requires batch at BDV & Final Testing. Since nothing comes after this,
-// a submission here also flips the batch's Status from 'In Process' to
-// 'Complete' — this is the end of the technical record for the batch.
+// Requires batch at BDV & Final Testing. The inspector's verdict sets the
+// batch's Status: Pass marks it Complete, Reject marks it Rejected, and
+// Hold leaves it at Final QA, On Hold, to be tested again. Every round's
+// readings are kept, dated and with that round's verdict.
 // ============================================================
+
+var QA_VERDICTS = { Pass: 'Complete', Hold: 'On Hold', Reject: 'Rejected' };
 
 function submitFinalQA_(session, params) {
   requireStageAccess_(session, 'enterFinalQA');
   if (!String(params.masterBatchNo || '').trim()) throw new Error('Master Batch No is required');
-  if (!Array.isArray(params.results) || params.results.length === 0) {
-    throw new Error('At least one test result is required');
+  var verdict = String(params.verdict || '').trim();
+  if (!QA_VERDICTS[verdict]) {
+    throw new Error('Pick the QA verdict: Pass, Hold or Reject. If the form has no verdict box, reload the app.');
   }
+  var rows = (Array.isArray(params.results) ? params.results : []).filter(function (r) { return r && r.testType && r.sampleId; });
+  if (rows.length === 0) throw new Error('At least one test result is required');
   var batch = getBatchRow_(params.masterBatchNo);
-  requireStage_(batch, 'BDV & Final Testing', 'Final QA');
+  // A batch put on hold is tested again from where it stands.
+  var retest = batch.currentStage === 'Final QA' && batch.status === 'On Hold';
+  if (!retest) requireStage_(batch, 'BDV & Final Testing', 'Final QA');
 
+  var now = new Date();
   var resultsSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('FinalQA_Results');
-  params.results.forEach(function (r) {
-    if (!r.testType || !r.sampleId) return;
-    appendRowByHeader_(resultsSheet, {
+  ensureColumns_(resultsSheet, ['Date', 'Verdict']);
+  appendRowsByHeader_(resultsSheet, rows.map(function (r) {
+    return {
       MasterBatchNo: batch.masterBatchNo,
       TestType: r.testType,
       SampleID: r.sampleId,
       Reading: r.reading || '',
       FOAInspectorName: params.foaInspectorName || '',
-      Notes: params.notes || ''
-    });
-  });
+      Notes: params.notes || '',
+      Date: now,
+      Verdict: verdict
+    };
+  }));
 
+  var status = QA_VERDICTS[verdict];
   advanceStage_(batch, 'Final QA');
-  batch.sheet.getRange(batch.rowIdx, batch.map['Status'] + 1).setValue('Complete');
-  return { masterBatchNo: batch.masterBatchNo, status: 'Complete' };
+  ensureColumns_(batch.sheet, ['QAVerdict', 'CompletedDate']);
+  var map = headerIndexMap_(batch.sheet);
+  batch.sheet.getRange(batch.rowIdx, map['Status'] + 1).setValue(status);
+  batch.sheet.getRange(batch.rowIdx, map['QAVerdict'] + 1).setValue(verdict);
+  batch.sheet.getRange(batch.rowIdx, map['CompletedDate'] + 1).setValue(verdict === 'Hold' ? '' : now);
+  return { masterBatchNo: batch.masterBatchNo, status: status, verdict: verdict };
 }
 
-function getFinalQAResults_() {
-  return readSheetAsObjects_(SpreadsheetApp.getActiveSpreadsheet().getSheetByName('FinalQA_Results'));
+function getFinalQAResults_(params) {
+  return readEntries_('FinalQA_Results', params);
+}
+
+// ============================================================
+// NOT APPLICABLE — a stage some batches don't go through
+//
+// Pouring & Curing is for Kvar, Aircon and Oil capacitors (the card's own
+// heading), but Electrical Testing & Packing requires a batch to have
+// passed it. A batch it doesn't apply to is marked "Not applicable" here:
+// the skip is logged with who marked it and why, and the batch moves on
+// as if the stage were done. The order of the card is unchanged, and a
+// batch that is poured is entered exactly as before.
+// ============================================================
+
+// Each stage that can be marked not applicable, with the stage a batch
+// must be at first and the permission that records it.
+var OPTIONAL_STAGES = {
+  'Pouring & Curing': { after: 'Welding', permission: 'enterPouringCuring' }
+};
+
+function skipStage_(session, params) {
+  var stage = String(params.stage || '').trim();
+  var rule = OPTIONAL_STAGES[stage];
+  if (!rule) throw new Error((stage || 'That stage') + ' can\u2019t be marked not applicable.');
+  requireStageAccess_(session, rule.permission);
+  var batch = getBatchRow_(params.masterBatchNo);
+  requireStage_(batch, rule.after, stage);
+
+  var sheet = getOrCreateSheet_(SpreadsheetApp.getActiveSpreadsheet(), 'Stage_Skips', ELE_TAB_SCHEMA['Stage_Skips']);
+  appendRowByHeader_(sheet, {
+    MasterBatchNo: batch.masterBatchNo, Stage: stage, Date: new Date(), By: session.Username,
+    Reason: String(params.reason || '').trim()
+  });
+  advanceStage_(batch, stage);
+  return { masterBatchNo: batch.masterBatchNo, stage: stage, skipped: true };
+}
+
+function getStageSkips_(params) {
+  if (!SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Stage_Skips')) return [];
+  return readEntries_('Stage_Skips', params, true);
+}
+
+// ============================================================
+// VOID — an Admin takes back a batch's latest stage entry
+//
+// A wrong entry used to be fixable only by editing the sheet, and a batch
+// couldn't be stepped back. Voiding marks the batch's current stage entry
+// (its rows stay, marked Voided with who, when and why) and moves
+// CurrentStage back one step, so that stage can be entered again. Only the
+// latest stage can be voided, so the card's order always holds. Voiding
+// Final QA puts the batch back In Process.
+// ============================================================
+
+// The card in order. CurrentStage names the last stage a batch finished.
+var STAGE_CHAIN = [
+  { stage: 'Winding', tabs: ['Winding'] },
+  { stage: 'Spray', tabs: ['PaperMaskingSpray'] },
+  { stage: 'Heat Stabilization', tabs: ['HeatStabilization'] },
+  { stage: 'Short Clearing', tabs: ['ShortClearing', 'ShortClearing_Testing'] },
+  { stage: 'Welding', tabs: ['Welding'] },
+  { stage: 'Pouring & Curing', tabs: ['PouringCuring'] },
+  { stage: 'Electrical Testing & Packing', tabs: ['PouringElectricalPacking'] },
+  { stage: 'BDV & Final Testing', tabs: ['BDVFinalTesting'] },
+  { stage: 'Final QA', tabs: ['FinalQA_Results'] }
+];
+
+function voidLastStage_(session, params) {
+  if (!isMfgAdmin_(session)) throw new Error('Only an Admin can void an entry.');
+  var reason = String(params.reason || '').trim();
+  if (!reason) throw new Error('Say why the entry is being voided.');
+  var batch = getBatchRow_(params.masterBatchNo);
+  // The screen it was voided from must still be showing the batch as it is.
+  if (params.stage && String(params.stage) !== String(batch.currentStage)) {
+    throw new Error(batch.masterBatchNo + ' is at ' + batch.currentStage + ' now, not ' + params.stage + '. Reload and try again.');
+  }
+  var at = -1;
+  STAGE_CHAIN.forEach(function (c, i) { if (c.stage === batch.currentStage) at = i; });
+  if (at === -1) throw new Error(batch.masterBatchNo + '\u2019s stage (' + batch.currentStage + ') isn\u2019t one of the card\u2019s stages.');
+  if (at === 0) throw new Error('A batch at Winding has no later entry to void. A wrong winding shift is corrected in the sheet.');
+
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var now = new Date();
+  var voided = 0;
+  var mark = function (sheet, keep) {
+    if (!sheet || sheet.getLastRow() < 2) return;
+    ensureColumns_(sheet, VOID_COLUMNS);
+    var meta = sheetMeta_(sheet);
+    var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, meta.lastCol).getValues();
+    values.forEach(function (row, i) {
+      var r = {};
+      meta.headers.forEach(function (h, c) { if (h) r[h] = row[c]; });
+      if (String(r.MasterBatchNo) !== batch.masterBatchNo || isVoided_(r) || !keep(r)) return;
+      var set = { Voided: true, VoidedBy: session.Username, VoidedAt: now, VoidReason: reason };
+      Object.keys(set).forEach(function (k) { sheet.getRange(i + 2, meta.map[k] + 1).setValue(sheetSafe_(set[k])); });
+      voided++;
+    });
+  };
+  STAGE_CHAIN[at].tabs.forEach(function (t) { mark(ss.getSheetByName(t), function () { return true; }); });
+  mark(ss.getSheetByName('Stage_Skips'), function (r) { return r.Stage === batch.currentStage; });
+
+  var back = STAGE_CHAIN[at - 1].stage;
+  advanceStage_(batch, back);
+  if (batch.currentStage === 'Final QA') {
+    var map = headerIndexMap_(batch.sheet);
+    batch.sheet.getRange(batch.rowIdx, map['Status'] + 1).setValue('In Process');
+    if (map['QAVerdict'] !== undefined) batch.sheet.getRange(batch.rowIdx, map['QAVerdict'] + 1).setValue('');
+    if (map['CompletedDate'] !== undefined) batch.sheet.getRange(batch.rowIdx, map['CompletedDate'] + 1).setValue('');
+  }
+  logAudit_(session.Username, 'VOID_STAGE', 'ELE', batch.masterBatchNo, batch.currentStage,
+            'Stepped back to ' + back + ' \u00b7 ' + voided + ' row' + (voided === 1 ? '' : 's') + ' voided \u00b7 ' + reason);
+  return { masterBatchNo: batch.masterBatchNo, voidedStage: batch.currentStage, currentStage: back, rowsVoided: voided };
+}
+
+// Everything recorded against one batch, voided entries left out, for its
+// report. The lists the app loads hold only recent rows; this reads the
+// batch's own rows whatever their age.
+function getBatchRecord_(params) {
+  var no = String(params.masterBatchNo || '').trim();
+  if (!no) throw new Error('Master Batch No is required');
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var pick = function (tab) {
+    var sheet = ss.getSheetByName(tab);
+    if (!sheet) return [];
+    return readSheetAsObjects_(sheet).filter(function (r) { return String(r.MasterBatchNo) === no && !isVoided_(r); });
+  };
+  return {
+    masterBatchNo: no,
+    winding: pick('Winding'), spray: pick('PaperMaskingSpray'), heatStab: pick('HeatStabilization'),
+    shortClearing: pick('ShortClearing'), scTesting: pick('ShortClearing_Testing'), welding: pick('Welding'),
+    pouringCuring: pick('PouringCuring'), electricalPacking: pick('PouringElectricalPacking'), bdv: pick('BDVFinalTesting'),
+    finalQa: pick('FinalQA_Results'), skips: pick('Stage_Skips')
+  };
+}
+
+// ============================================================
+// IDEMPOTENCY — a resent write gets its first answer back
+//
+// The app gives each entry a clientTxnId and sends the same one again if
+// the reply was lost. Looked up and recorded inside the write lock, so a
+// resend that arrives while the original is still running waits for it,
+// then finds it.
+// ============================================================
+
+function findIdempotentResult_(clientTxnId) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(IDEMPOTENCY_TAB);
+  if (!sheet) return null;
+  var meta = sheetMeta_(sheet);
+  if (meta.map['ClientTxnId'] === undefined) return null;
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return null;
+  var startRow = Math.max(2, lastRow - IDEMPOTENCY_SCAN_ROWS + 1);
+  var ids = sheet.getRange(startRow, meta.map['ClientTxnId'] + 1, lastRow - startRow + 1, 1).getValues();
+  for (var i = ids.length - 1; i >= 0; i--) {
+    if (String(ids[i][0]) !== clientTxnId) continue;
+    var values = sheet.getRange(startRow + i, 1, 1, meta.lastCol).getValues()[0];
+    var row = {};
+    meta.headers.forEach(function (h, c) { if (h) row[h] = values[c]; });
+    var result = null;
+    try { result = JSON.parse(row.Result || 'null'); } catch (err) { result = null; }
+    return { action: row.Action, user: row.User, result: result };
+  }
+  return null;
+}
+
+function recordIdempotentResult_(clientTxnId, action, username, result) {
+  var sheet = getOrCreateSheet_(SpreadsheetApp.getActiveSpreadsheet(), IDEMPOTENCY_TAB, ELE_TAB_SCHEMA[IDEMPOTENCY_TAB]);
+  appendRowByHeader_(sheet, {
+    ClientTxnId: clientTxnId, Action: action, User: username || '', Timestamp: new Date(),
+    Result: JSON.stringify(result === undefined ? null : result)
+  });
+}
+
+// IDs are random per entry, so one that comes back for another action or
+// another person is a client bug, not a resend; replaying it would report
+// work that wasn't done.
+function replayOf_(clientTxnId, action, session) {
+  var prior = findIdempotentResult_(clientTxnId);
+  if (!prior) return null;
+  if (prior.action && prior.action !== action) {
+    throw new Error('This entry\u2019s ID was already used for a different action (' + prior.action + '). Reload the app and try again.');
+  }
+  if (prior.user && prior.user !== session.Username) {
+    throw new Error('This entry\u2019s ID belongs to someone else\u2019s entry. Reload the app and try again.');
+  }
+  var replay = prior.result;
+  if (replay && typeof replay === 'object' && !Array.isArray(replay)) replay.duplicate = true;
+  return { result: replay };
 }
 
 // ============================================================
@@ -1019,7 +1357,13 @@ function handleRequest_(e) {
       data = routeAction_(action, session, params);
     } else {
       data = withWriteLock_(function () {
+        var clientTxnId = String(params.clientTxnId || '').trim();
+        if (clientTxnId) {
+          var replay = replayOf_(clientTxnId, action, session);
+          if (replay) return replay.result;
+        }
         var result = routeAction_(action, session, params);
+        if (clientTxnId) recordIdempotentResult_(clientTxnId, action, session.Username, result);
         var batchNo = params.masterBatchNo || (result && (result.masterBatchNo || result.MasterBatchNo)) || '';
         logAudit_(session.Username, action, 'ELE', batchNo, '', auditSummary_(params));
         return result;
@@ -1046,7 +1390,7 @@ function routeAction_(action, session, params) {
     case 'addWindingShift':
       return addWindingShift_(session, params);
     case 'getWindingEntries':
-      return getWindingEntries_();
+      return getWindingEntries_(params);
     case 'getBatchMasterList':
       return getBatchMasterList_();
     case 'getFGCatalog':
@@ -1056,43 +1400,53 @@ function routeAction_(action, session, params) {
     case 'enterSpray':
       return enterSpray_(session, params);
     case 'getSprayEntries':
-      return getSprayEntries_();
+      return getSprayEntries_(params);
     case 'enterHeatStab':
       return enterHeatStab_(session, params);
     case 'getHeatStabEntries':
-      return getHeatStabEntries_();
+      return getHeatStabEntries_(params);
 
     // --- Phase 3: Short Clearing ---
     case 'enterShortClearing':
       return enterShortClearing_(session, params);
     case 'getShortClearingEntries':
-      return getShortClearingEntries_();
+      return getShortClearingEntries_(params);
     case 'getShortClearingTestResults':
-      return getShortClearingTestResults_();
+      return getShortClearingTestResults_(params);
 
     // --- Phase 4: Welding + Pouring & Curing + Electrical Testing & Packing ---
     case 'enterWelding':
       return enterWelding_(session, params);
     case 'getWeldingEntries':
-      return getWeldingEntries_();
+      return getWeldingEntries_(params);
     case 'enterPouringCuring':
       return enterPouringCuring_(session, params);
     case 'getPouringCuringEntries':
-      return getPouringCuringEntries_();
+      return getPouringCuringEntries_(params);
     case 'enterElectricalPacking':
       return enterElectricalPacking_(session, params);
     case 'getElectricalPackingEntries':
-      return getElectricalPackingEntries_();
+      return getElectricalPackingEntries_(params);
 
     // --- Phase 5: BDV & Final Testing + Final QA (last two stages) ---
     case 'enterBDV':
       return enterBDV_(session, params);
     case 'getBDVEntries':
-      return getBDVEntries_();
+      return getBDVEntries_(params);
     case 'submitFinalQA':
       return submitFinalQA_(session, params);
     case 'getFinalQAResults':
-      return getFinalQAResults_();
+      return getFinalQAResults_(params);
+
+    // --- Not applicable, corrections, one batch's whole record ---
+    case 'skipStage':
+      return skipStage_(session, params);
+    case 'getStageSkips':
+      return getStageSkips_(params);
+    case 'voidLastStage':
+      return voidLastStage_(session, params);
+    case 'getBatchRecord':
+      return getBatchRecord_(params);
 
     default:
       throw new Error('Unknown action: ' + action);
@@ -1155,8 +1509,21 @@ function ADMIN_setupSheet() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var created = [];
   var existing = [];
+  var columnsAdded = [];
   Object.keys(ELE_TAB_SCHEMA).forEach(function (name) {
-    if (ss.getSheetByName(name)) { existing.push(name); return; }
+    var sheet = ss.getSheetByName(name);
+    if (sheet) {
+      existing.push(name);
+      // A tab made before a column existed gains it, at the end. Nothing
+      // already there moves. Dropdowns is left alone: its columns are
+      // lists people add as they need them.
+      if (name !== 'Dropdowns' && sheet.getLastColumn() > 0) {
+        var before = sheetMeta_(sheet).lastCol;
+        ensureColumns_(sheet, ELE_TAB_SCHEMA[name]);
+        if (sheetMeta_(sheet).lastCol > before) columnsAdded.push(name);
+      }
+      return;
+    }
     getOrCreateSheet_(ss, name, ELE_TAB_SCHEMA[name]);
     created.push(name);
   });
@@ -1170,7 +1537,14 @@ function ADMIN_setupSheet() {
   var sheet1 = ss.getSheetByName('Sheet1');
   if (sheet1 && ss.getSheets().length > 1 && sheet1.getLastRow() === 0) ss.deleteSheet(sheet1);
 
+  var tz = Session.getScriptTimeZone();
+  var tzNote = tz === 'Asia/Kolkata' ? '' :
+    'The script\u2019s time zone is ' + tz + ', not Asia/Kolkata, so batch serials roll over to the new financial year at the wrong hour. ' +
+    'Change it under Project Settings \u2192 Time zone.';
+
   Logger.log('Created: ' + (created.join(', ') || '(none — all tabs already existed)'));
   Logger.log('Already existed: ' + (existing.join(', ') || '(none)'));
-  return { created: created, existing: existing };
+  Logger.log('New columns added to: ' + (columnsAdded.join(', ') || '(none)'));
+  if (tzNote) Logger.log(tzNote);
+  return { created: created, existing: existing, columnsAdded: columnsAdded, timeZoneNote: tzNote };
 }
