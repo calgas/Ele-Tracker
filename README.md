@@ -4,10 +4,16 @@ A production-tracking app for the **Winding → Final QA** capacitor batch card 
 
 This is a sibling app to CALGAS CAPACITORS' **Stock Management** app, not a replacement for the broader Manufacturing Tracker (order-to-dispatch) project — ELE Tracker's scope is specifically the physical Winding-to-FQA batch card.
 
-**Current version:** 1.3.0
+**Current version:** 1.4.1
 **Repo:** `calgas/Ele-Tracker` · **Hosted:** https://calgas.github.io/Ele-Tracker/
 
 ---
+
+## What changed in 1.4.1
+
+**Sign-in works again.** ELE Tracker was still signing people in through the old Stock Management copy, which has since been deleted, so nobody could sign in. It now signs in through the live Stock Management, with the same username and password.
+
+**Safer sessions.** Stock Management now keeps sign-in tokens hashed, and ELE Tracker looks them up the same way. Only an ELE Tracker sign-in is accepted here; a Stock Management or Production Tracker session for the same person isn't.
 
 ## What changed in 1.4.0
 
